@@ -250,6 +250,11 @@ set(mirror_vfd_SOURCES
     ${HDF5_TEST_SOURCE_DIR}/genall5.c
 )
 
+set(hermes_vfd_SOURCES
+    ${HDF5_TEST_SOURCE_DIR}/hermes_vfd.c
+    ${HDF5_TEST_SOURCE_DIR}/genall5.c
+)
+
 set (ttsafe_SOURCES
     ${HDF5_TEST_SOURCE_DIR}/ttsafe.h
     ${HDF5_TEST_SOURCE_DIR}/ttsafe.c
@@ -319,6 +324,7 @@ set (H5_TESTS
     s3comms
     hdfs
     mirror_vfd
+    hermes_vfd
     ntypes
     dangle
     dtransform

@@ -46,6 +46,8 @@ if (CMAKE_VERSION VERSION_LESS "3.14.0")
   endif()
 endif ()
 
+set(CMAKE_MACOSX_RPATH ON)
+ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 #-----------------------------------------------------------------------------
 # Instructions for use : Sub-Project Build
 #

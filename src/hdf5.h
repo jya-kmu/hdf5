@@ -47,6 +47,7 @@
 #include "H5FDdirect.h"   /* Linux direct I/O                         */
 #include "H5FDfamily.h"   /* File families                            */
 #include "H5FDhdfs.h"     /* Hadoop HDFS                              */
+#include "H5FDhermes.h"   /* Hermes driver                            */
 #include "H5FDlog.h"      /* sec2 driver with I/O logging (for debugging) */
 #include "H5FDmirror.h"   /* Mirror VFD and IPC definitions           */
 #include "H5FDmpi.h"      /* MPI-based file drivers                   */

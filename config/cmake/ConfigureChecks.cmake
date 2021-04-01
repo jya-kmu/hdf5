@@ -218,6 +218,24 @@ if (H5FD_ENABLE_MIRROR_VFD)
 endif()
 
 #-----------------------------------------------------------------------------
+#  Check if Hermes driver can be built
+#-----------------------------------------------------------------------------
+option (HDF5_ENABLE_HERMES_VFD "Build the Hermes Virtual File Driver" ON)
+if (HDF5_ENABLE_HERMES_VFD)
+  find_package(hermes REQUIRED)
+  if (hermes_FOUND)
+    message(STATUS "found hermes at ${hermes_DIR}")
+    include_directories (${HERMES_INCLUDE_DIR})
+    set (LINK_LIBS ${LINK_LIBS} hermes_wrapper)
+    set (LINK_SHARED_LIBS ${LINK_SHARED_LIBS} hermes_wrapper)
+  else()
+    message(WARNING "The Hermes VFD was requested but cannot be built.\nPlease check that Hermes are available on your\nsystem, and/or re-configure without option HDF5_ENABLE_HERMES_VFD.")
+  endif()
+endif()
+set(CMAKE_MACOSX_RPATH ON)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+#-----------------------------------------------------------------------------
 # Check if C has __float128 extension
 #-----------------------------------------------------------------------------
 
