@@ -52,7 +52,7 @@ const size_t kPageSize = 1024 * 1024;
  */
 const char *kHermesConf = "HERMES_CONF";
 
-static char **hermes_buckets;
+char **hermes_buckets = NULL;
 static size_t num_buckets;
 
 /* The description of a file belonging to this driver. The 'eoa' and 'eof'
@@ -68,15 +68,17 @@ static size_t num_buckets;
  */
 typedef struct H5FD_hermes_t {
     H5FD_t         pub; /* public stuff, must be first      */
-//    int            fd;  /* the filesystem file descriptor   */
+    int            fd;  /* the filesystem file descriptor   */
     haddr_t        eoa; /* end of allocated region          */
     haddr_t        eof; /* end of file; current file size   */
     haddr_t        pos; /* current file I/O position        */
     H5FD_file_op_t op;  /* last operation                   */
-    hbool_t        ignore_disabled_file_locks;
     char           bktname[H5FD_MAX_FILENAME_LEN]; /* Copy of file name from open operation */
-    BucketClass   *bkt_handle;
+    int            o_flags;     /* Flags for open() call    */
+    off_t          st_size;        /* total size, in bytes */
+    off_t          st_ptr;         /* Current ptr of FILE */
     int32_t        ref_count;        /* # of time process opens a file */
+    BucketClass   *bkt_handle;
     char **st_blobs;         /* Blobs access in the bucket */
     blksize_t st_blksize; /* blocksize for blob within bucket */
 } H5FD_hermes_t;
@@ -168,11 +170,10 @@ H5FL_DEFINE_STATIC(H5FD_hermes_t);
 static herr_t
 H5FD__init_package(void)
 {
-    char * lock_env_var = NULL; /* Environment variable pointer */
     herr_t ret_value    = SUCCEED;
 
     FUNC_ENTER_STATIC
-    printf("    Hermes VFD H5FD__init_package()\n");
+    printf("    Enter H5FD__init_package()\n");
 
     if (H5FD_hermes_init() < 0)
         HGOTO_ERROR(H5E_VFL, H5E_CANTINIT, FAIL, "unable to initialize hermes VFD")
@@ -205,6 +206,8 @@ H5FD_hermes_init(void)
 
     if (H5I_VFL != H5I_get_type(H5FD_HERMES_g))
         H5FD_HERMES_g = H5FD_register(&H5FD_hermes_g, sizeof(H5FD_class_t), FALSE);
+
+    printf("    End of H5FD_hermes_init(), H5FD_HERMES_g = %d\n", H5FD_HERMES_g);
     
     /* Set return value */
     ret_value = H5FD_HERMES_g;
@@ -264,6 +267,7 @@ H5Pset_fapl_hermes(hid_t fapl_id)
     if (NULL == (plist = H5P_object_verify(fapl_id, H5P_FILE_ACCESS)))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list")
 
+    printf("    Call H5P_set_driver()\n");
     ret_value = H5P_set_driver(plist, H5FD_HERMES, NULL);
 
 done:
@@ -297,7 +301,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     H5FD_t *        ret_value = NULL; /* Return value */
 
     FUNC_ENTER_STATIC
-    printf("    Hermes VFD H5FD__hermes_open()\n");
+    printf("    Hermes VFD H5FD__hermes_open() \n");
+    printf("    open file %s\n", name);
 
     /* Sanity check on file offsets */
     HDcompile_assert(sizeof(HDoff_t) >= sizeof(size_t));
@@ -311,13 +316,16 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
         HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, NULL, "bogus maxaddr")
         
     /* Initialize hermes here */
-/*    if ((H5OPEN hermes_initialized) == FAIL) {
+    if ((H5OPEN hermes_initialized) == FAIL) {
         hermes_config = HDgetenv(kHermesConf);
-        if (HermesInitHermes(hermes_config) < 0)
+        printf("    Hermes VFD init hermes\n");
+        if (HermesInitHermes(hermes_config) < 0) {
             HGOTO_ERROR(H5E_SYM, H5E_UNINITIALIZED, NULL, "Hermes initialization failed")
-        else
+        }
+        else {
             hermes_initialized = TRUE;
-    } */
+        }
+    }
 
     /* Build the open flags */
     o_flags = (H5F_ACC_RDWR & flags) ? O_RDWR : O_RDONLY;
@@ -327,35 +335,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
         o_flags |= O_CREAT;
     if (H5F_ACC_EXCL & flags)
         o_flags |= O_EXCL;
-        
-    if (NULL == hermes_buckets)
-        hermes_buckets = malloc(sizeof(char*));
-        
-    int i;
-    int found_bucket = 0;
-    for (i = 0; i < num_buckets; i++) {
-        if (!strcmp(hermes_buckets[i], name)) {
-            found_bucket = 1;
-            printf("found bucket %s\n", name);
-        }
-    }
-    
-    if (!found_bucket) {
-        /* Create the new file struct */
-        printf("    Hermes VFD allocate H5FD_hermes_t\n");
-        if (NULL == (file = H5FL_CALLOC(H5FD_hermes_t)))
-            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, NULL, "unable to allocate file struct")
-    
-        HDstrncpy(file->bktname, name, sizeof(file->bktname));
-        file->bktname[sizeof(file->bktname) - 1] = '\0';
-        H5_CHECKED_ASSIGN(file->eof, haddr_t, sb.st_size, h5_stat_size_t);
-        file->pos = HADDR_UNDEF;
-        file->op  = OP_UNKNOWN;
-        
-        file->bkt_handle = HermesBucketCreate(name);
-    }
 
-    /* Open the file */  //no???????????????????????
+    /* Open the file */
     if ((fd = HDopen(name, o_flags, H5_POSIX_CREATE_MODE_RW)) < 0) {
         int myerrno = errno;
         HGOTO_ERROR(
@@ -367,12 +348,32 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     if (HDfstat(fd, &sb) < 0)
         HSYS_GOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "unable to fstat file")
 
-    /* Create the new file struct */
-//    if (NULL == (file = H5FL_CALLOC(H5FD_hermes_t)))
-//        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, NULL, "unable to allocate file struct")
-
- //   file->fd = fd;
+    int i;
+    int found_bucket = 0;
+    for (i = 0; i < num_buckets; i++) {
+        if (!strcmp(hermes_buckets[i], name)) {
+            found_bucket = 1;
+            printf("found bucket %s\n", name);
+        }
+    }
     
+    if (!found_bucket) {
+        printf("    allocate H5FD_hermes_t\n");
+        /* Create the new file struct */
+        if (NULL == (file = H5FL_CALLOC(H5FD_hermes_t)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, NULL, "unable to allocate file struct")
+        HDstrncpy(file->bktname, name, sizeof(file->bktname));
+        file->bktname[sizeof(file->bktname) - 1] = '\0';
+        H5_CHECKED_ASSIGN(file->eof, haddr_t, sb.st_size, h5_stat_size_t);
+        file->pos = HADDR_UNDEF;
+        file->op  = OP_UNKNOWN;
+        
+        file->bkt_handle = HermesBucketCreate(name);
+    }
+
+    H5_CHECKED_ASSIGN(file->eof, haddr_t, sb.st_size, h5_stat_size_t);
+    file->pos = HADDR_UNDEF;
+    file->op  = OP_UNKNOWN;
 
     /* Get the FAPL */
     if (NULL == (plist = (H5P_genplist_t *)H5I_object(fapl_id)))
@@ -445,12 +446,11 @@ H5FD__hermes_close(H5FD_t *_file)
 
     /* Sanity check */
     HDassert(file);
-    
-    HermesBucketClose(file->bkt_handle);
 
+    HermesBucketClose(file->bkt_handle);
     /* Close the underlying file */
-//    if (HDclose(file->fd) < 0)
-//        HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
+    if (HDclose(file->fd) < 0)
+        HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
 
     /* Release the file info */
     file = H5FL_FREE(H5FD_hermes_t, file);
@@ -527,7 +527,7 @@ H5FD__hermes_query(const H5FD_t *_file, unsigned long *flags /* out */)
             H5FD_FEAT_SUPPORTS_SWMR_IO; /* VFD supports the single-writer/multiple-readers (SWMR) pattern   */
         *flags |= H5FD_FEAT_DEFAULT_VFD_COMPATIBLE; /* VFD creates a file which can be opened with the default
                                                        VFD      */
-    }                                            /* end if */
+     }
 
     FUNC_LEAVE_NOAPI(SUCCEED)
 } /* end H5FD__hermes_query() */
@@ -578,7 +578,7 @@ H5FD__hermes_set_eoa(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, haddr_t addr
 
     FUNC_ENTER_STATIC_NOERR
     printf("    Hermes VFD H5FD__hermes_set_eoa(): eoa = %lu\n", addr);
-    
+
     file->eoa = addr;
 
     FUNC_LEAVE_NOAPI(SUCCEED)
@@ -634,7 +634,7 @@ H5FD__hermes_get_handle(H5FD_t *_file, hid_t H5_ATTR_UNUSED fapl, void **file_ha
     if (!file_handle)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "file handle not valid")
 
- //   *file_handle = &(file->fd);
+    *file_handle = &(file->fd);
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
@@ -675,6 +675,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "addr undefined, addr = %llu", (unsigned long long)addr)
     if (REGION_OVERFLOW(addr, size))
         HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu", (unsigned long long)addr)
+
 #if 0
 #ifndef H5_HAVE_PREADWRITE
     /* Seek to the correct location (if we don't have pread) */
@@ -700,7 +701,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
 
         do {
 #ifdef H5_HAVE_PREADWRITE
- //           bytes_read = HDpread(file->fd, buf, bytes_in, offset);
+            bytes_read = HDpread(file->fd, buf, bytes_in, offset);
             if (bytes_read > 0)
                 offset += bytes_read;
 #else
@@ -712,16 +713,16 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
             int    myerrno = errno;
             time_t mytime  = HDtime(NULL);
 
-  //          offset = HDlseek(file->fd, (HDoff_t)0, SEEK_CUR);
+            offset = HDlseek(file->fd, (HDoff_t)0, SEEK_CUR);
 
-   /*         HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
-                        "file read failed: time = %s, filename = '%s', file descriptor = %d, errno = %d, "
+            HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
+                        "file read failed: time = %s, bktname = '%s', file descriptor = %d, errno = %d, "
                         "error message = '%s', buf = %p, total read size = %llu, bytes this sub-read = %llu, "
                         "bytes actually read = %llu, offset = %llu",
                         HDctime(&mytime), file->bktname, file->fd, myerrno, HDstrerror(myerrno), buf,
                         (unsigned long long)size, (unsigned long long)bytes_in,
                         (unsigned long long)bytes_read, (unsigned long long)offset);
-     */   } /* end if */
+        } /* end if */
 
         if (0 == bytes_read) {
             /* end of file but not end of format address space */
@@ -736,11 +737,11 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
         addr += (haddr_t)bytes_read;
         buf = (char *)buf + bytes_read;
     } /* end while */
-
+#endif
     /* Update current position */
     file->pos = addr;
     file->op  = OP_READ;
-#endif
+
 done:
     if (ret_value < 0) {
         /* Reset last file I/O information */
@@ -775,8 +776,8 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
 
     FUNC_ENTER_STATIC
     printf("    Hermes VFD H5FD__hermes_write()\n");
-    printf("    size = %ld\n", size);
-    printf("    mem type is %d\n", type);
+    printf("    write size = %ld\n", size);
+    printf("    write mem type is %d\n", type);
 
     HDassert(file && file->pub.cls);
     HDassert(buf);
@@ -787,6 +788,7 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
     if (REGION_OVERFLOW(addr, size))
         HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu, size = %llu",
                     (unsigned long long)addr, (unsigned long long)size)
+
 #if 0
 #ifndef H5_HAVE_PREADWRITE
     /* Seek to the correct location (if we don't have pwrite) */
@@ -812,7 +814,7 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
 
         do {
 #ifdef H5_HAVE_PREADWRITE
- //           bytes_wrote = HDpwrite(file->fd, buf, bytes_in, offset);
+            bytes_wrote = HDpwrite(file->fd, buf, bytes_in, offset);
             if (bytes_wrote > 0)
                 offset += bytes_wrote;
 #else
@@ -824,31 +826,32 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
             int    myerrno = errno;
             time_t mytime  = HDtime(NULL);
 
-  //          offset = HDlseek(file->fd, (HDoff_t)0, SEEK_CUR);
+            offset = HDlseek(file->fd, (HDoff_t)0, SEEK_CUR);
 
-  /*          HGOTO_ERROR(H5E_IO, H5E_WRITEERROR, FAIL,
-                        "file write failed: time = %s, filename = '%s', file descriptor = %d, errno = %d, "
+            HGOTO_ERROR(H5E_IO, H5E_WRITEERROR, FAIL,
+                        "file write failed: time = %s, bktname = '%s', file descriptor = %d, errno = %d, "
                         "error message = '%s', buf = %p, total write size = %llu, bytes this sub-write = "
                         "%llu, bytes actually written = %llu, offset = %llu",
                         HDctime(&mytime), file->bktname, file->fd, myerrno, HDstrerror(myerrno), buf,
                         (unsigned long long)size, (unsigned long long)bytes_in,
                         (unsigned long long)bytes_wrote, (unsigned long long)offset);
-   */     } /* end if */
+        } /* end if */
 
- //       HDassert(bytes_wrote > 0);
- //       HDassert((size_t)bytes_wrote <= size);
+        HDassert(bytes_wrote > 0);
+        HDassert((size_t)bytes_wrote <= size);
 
         size -= (size_t)bytes_wrote;
         addr += (haddr_t)bytes_wrote;
         buf = (const char *)buf + bytes_wrote;
     } /* end while */
+#endif
 
     /* Update current position and eof */
     file->pos = addr;
     file->op  = OP_WRITE;
     if (file->pos > file->eof)
         file->eof = file->pos;
-#endif
+
 done:
     if (ret_value < 0) {
         /* Reset last file I/O information */
@@ -912,8 +915,8 @@ H5FD__hermes_truncate(H5FD_t *_file, hid_t H5_ATTR_UNUSED dxpl_id, hbool_t H5_AT
         if (0 == bError)
             HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
 #else  /* H5_HAVE_WIN32_API */
- //       if (-1 == HDftruncate(file->fd, (HDoff_t)file->eoa))
- //           HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
+        if (-1 == HDftruncate(file->fd, (HDoff_t)file->eoa))
+            HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
 #endif /* H5_HAVE_WIN32_API */
 
         /* Update the eof value */
