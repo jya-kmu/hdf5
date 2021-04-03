@@ -323,6 +323,18 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     if (H5F_ACC_EXCL & flags)
         o_flags |= O_EXCL;
 
+    /* Initialize Hermes */
+    if ((H5OPEN hermes_initialized) == FAIL) {
+        hermes_config = HDgetenv(kHermesConf);
+        printf("hermes_config: %s\n", hermes_config);
+        if (HermesInitHermes(hermes_config) < 0)
+            HGOTO_ERROR(H5E_SYM, H5E_UNINITIALIZED, NULL, "Hermes initialization failed")
+        else {
+            hermes_initialized = TRUE;
+            hermes_buckets = malloc(sizeof(char*));
+        }
+    }
+
     /* Open the file */
     if ((fd = HDopen(name, o_flags, H5_POSIX_CREATE_MODE_RW)) < 0) {
         int myerrno = errno;
@@ -351,20 +363,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     /* Retain a copy of the name used to open the file, for possible error reporting */
     HDstrncpy(file->bktname, name, sizeof(file->bktname));
     file->bktname[sizeof(file->bktname) - 1] = '\0';
-    
-    if ((H5OPEN hermes_initialized) == FAIL) {
-        hermes_config = HDgetenv(kHermesConf);
-        printf("hermes_config: %s\n", hermes_config);
-        if (HermesInitHermes(hermes_config) < 0)
-            HGOTO_ERROR(H5E_SYM, H5E_UNINITIALIZED, NULL, "Hermes initialization failed")
-        else {
-            hermes_initialized = TRUE;
-            hermes_buckets = malloc(sizeof(char*));
-        }
-    }
 
-    if (NULL == hermes_buckets)
-        hermes_buckets = malloc(sizeof(char*));
+    file->bkt_handle = HermesBucketCreate(name);
     
     int i;
     int found_bucket = 0;
@@ -374,7 +374,6 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     }
     if (!found_bucket) {
         hermes_buckets[num_buckets++] = strdup(name);
-//        file->bkt_handle = HermesBucketCreate(name);
     }
         
 
@@ -431,6 +430,8 @@ H5FD__hermes_close(H5FD_t *_file)
 
     /* Sanity check */
     HDassert(file);
+
+    HermesBucketClose(file->bkt_handle);
 
     /* Close the underlying file */
     if (HDclose(file->fd) < 0)
