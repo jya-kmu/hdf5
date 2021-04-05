@@ -12,15 +12,12 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
+ * Programmer:  Kimmy Mu
+ *              March 2021
  *
- * Purpose: The hermes unbuffered file driver using only the HDF5 public
- *          API and with a few optimizations: the lseek() call is made
- *          only when the current file position is unknown or needs to be
- *          changed based on previous I/O through this driver (don't mix
- *          I/O from this driver with I/O from other parts of the
- *          application to the same file).
+ * Purpose: The hermes file driver using only the HDF5 public API
+ *          and buffer datasets in Hermes buffering systems with
+ *          multiple storage tiers.
  */
 
 #include "H5FDdrvr_module.h" /* This source code file is part of the H5FD driver module */
@@ -29,7 +26,7 @@
 #include "H5Eprivate.h"  /* Error handling           */
 #include "H5Fprivate.h"  /* File access              */
 #include "H5FDprivate.h" /* File drivers             */
-#include "H5FDhermes.h"    /* Hermes file driver         */
+#include "H5FDhermes.h"  /* Hermes file driver       */
 #include "H5FLprivate.h" /* Free Lists               */
 #include "H5Iprivate.h"  /* IDs                      */
 #include "H5MMprivate.h" /* Memory management        */
@@ -55,7 +52,7 @@ const char *kHermesConf = "HERMES_CONF";
 static char **hermes_buckets;
 static size_t num_buckets;
 
-/* The description of a file belonging to this driver. The 'eoa' and 'eof'
+/* The description of a bucket belonging to this driver. The 'eoa' and 'eof'
  * determine the amount of hdf5 address space in use and the high-water mark
  * of the file (the current size of the underlying filesystem file). The
  * 'pos' value is used to eliminate file position updates when they would be a
@@ -68,7 +65,6 @@ static size_t num_buckets;
  */
 typedef struct H5FD_hermes_t {
     H5FD_t         pub; /* public stuff, must be first      */
-    int            fd;  /* the filesystem file descriptor   */
     haddr_t        eoa; /* end of allocated region          */
     haddr_t        eof; /* end of file; current file size   */
     haddr_t        pos; /* current file I/O position        */
@@ -80,7 +76,6 @@ typedef struct H5FD_hermes_t {
     int32_t        ref_count;        /* # of time process opens a file */
     BucketClass   *bkt_handle;
     char **st_blobs;         /* Blobs access in the bucket */
-    blksize_t st_blksize; /* blocksize for blob within bucket */
 } H5FD_hermes_t;
 
 /*
@@ -122,37 +117,37 @@ static herr_t  H5FD__hermes_truncate(H5FD_t *_file, hid_t dxpl_id, hbool_t closi
 
 static const H5FD_class_t H5FD_hermes_g = {
     "hermes",                /* name                 */
-    MAXADDR,               /* maxaddr              */
-    H5F_CLOSE_WEAK,        /* fc_degree            */
+    MAXADDR,                 /* maxaddr              */
+    H5F_CLOSE_WEAK,          /* fc_degree            */
     H5FD__hermes_term,       /* terminate            */
-    NULL,                  /* sb_size              */
-    NULL,                  /* sb_encode            */
-    NULL,                  /* sb_decode            */
-    0,                     /* fapl_size            */
-    NULL,                  /* fapl_get             */
-    NULL,                  /* fapl_copy            */
-    NULL,                  /* fapl_free            */
-    0,                     /* dxpl_size            */
-    NULL,                  /* dxpl_copy            */
-    NULL,                  /* dxpl_free            */
+    NULL,                    /* sb_size              */
+    NULL,                    /* sb_encode            */
+    NULL,                    /* sb_decode            */
+    0,                       /* fapl_size            */
+    NULL,                    /* fapl_get             */
+    NULL,                    /* fapl_copy            */
+    NULL,                    /* fapl_free            */
+    0,                       /* dxpl_size            */
+    NULL,                    /* dxpl_copy            */
+    NULL,                    /* dxpl_free            */
     H5FD__hermes_open,       /* open                 */
     H5FD__hermes_close,      /* close                */
     H5FD__hermes_cmp,        /* cmp                  */
     H5FD__hermes_query,      /* query                */
-    NULL,                  /* get_type_map         */
-    NULL,                  /* alloc                */
-    NULL,                  /* free                 */
+    NULL,                    /* get_type_map         */
+    NULL,                    /* alloc                */
+    NULL,                    /* free                 */
     H5FD__hermes_get_eoa,    /* get_eoa              */
     H5FD__hermes_set_eoa,    /* set_eoa              */
     H5FD__hermes_get_eof,    /* get_eof              */
     H5FD__hermes_get_handle, /* get_handle           */
     H5FD__hermes_read,       /* read                 */
     H5FD__hermes_write,      /* write                */
-    NULL,                  /* flush                */
+    NULL,                    /* flush                */
     H5FD__hermes_truncate,   /* truncate             */
-    NULL,       /* lock                 */
-    NULL,     /* unlock               */
-    H5FD_FLMAP_DICHOTOMY   /* fl_map               */
+    NULL,                    /* lock                 */
+    NULL,                    /* unlock               */
+    H5FD_FLMAP_DICHOTOMY     /* fl_map               */
 };
 
 /* Declare a free list to manage the H5FD_hermes_t struct */
@@ -192,8 +187,8 @@ done:
  * Return:      Success:    The driver ID for the hermes driver
  *              Failure:    H5I_INVALID_HID
  *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -222,8 +217,8 @@ done:
  *
  * Returns:     SUCCEED (Can't fail)
  *
- * Programmer:  Quincey Koziol
- *              Friday, Jan 30, 2004
+ * Programmer:  Kimmy My
+ *              April 2021
  *
  *---------------------------------------------------------------------------
  */
@@ -248,8 +243,8 @@ H5FD__hermes_term(void)
  *
  * Return:      SUCCEED/FAIL
  *
- * Programmer:  Robb Matzke
- *              Thursday, February 19, 1998
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -275,15 +270,13 @@ done:
 /*-------------------------------------------------------------------------
  * Function:    H5FD__hermes_open
  *
- * Purpose:     Create and/or opens a file as an HDF5 file.
+ * Purpose:     Create and/or opens a bucket in Hermes.
  *
- * Return:      Success:    A pointer to a new file data structure. The
- *                          public fields will be initialized by the
- *                          caller, which is always H5FD_open().
+ * Return:      Success:    A pointer to a new bucket data structure.
  *              Failure:    NULL
  *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -291,17 +284,15 @@ static H5FD_t *
 H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
 {
     H5FD_hermes_t *file = NULL; /* hermes VFD info            */
-    int          fd   = -1;   /* File descriptor          */
     int          o_flags;     /* Flags for open() call    */
-    h5_stat_t       sb;
     H5P_genplist_t *plist;            /* Property list pointer */
     char *hermes_config = NULL;
+    int i;
+    int found_bucket = 0;
     H5FD_t *        ret_value = NULL; /* Return value */
 
     FUNC_ENTER_STATIC
     printf("  Hermes VFD H5FD__hermes_open()\n");
-    
-    // maybe init hermes here
 
     /* Sanity check on file offsets */
     HDcompile_assert(sizeof(HDoff_t) >= sizeof(size_t));
@@ -335,26 +326,9 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
         }
     }
 
-    /* Open the file */
-    if ((fd = HDopen(name, o_flags, H5_POSIX_CREATE_MODE_RW)) < 0) {
-        int myerrno = errno;
-        HGOTO_ERROR(
-            H5E_FILE, H5E_CANTOPENFILE, NULL,
-            "unable to open file: name = '%s', errno = %d, error message = '%s', flags = %x, o_flags = %x",
-            name, myerrno, HDstrerror(myerrno), flags, (unsigned)o_flags);
-    } /* end if */
-
-    if (HDfstat(fd, &sb) < 0)
-        HSYS_GOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "unable to fstat file")
-
     /* Create the new file struct */
     if (NULL == (file = H5FL_CALLOC(H5FD_hermes_t)))
         HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, NULL, "unable to allocate file struct")
-
-    file->fd = fd;
-    H5_CHECKED_ASSIGN(file->eof, haddr_t, sb.st_size, h5_stat_size_t);
-    file->pos = HADDR_UNDEF;
-    file->op  = OP_UNKNOWN;
 
     /* Get the FAPL */
     if (NULL == (plist = (H5P_genplist_t *)H5I_object(fapl_id)))
@@ -365,9 +339,7 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->bktname[sizeof(file->bktname) - 1] = '\0';
 
     file->bkt_handle = HermesBucketCreate(name);
-    
-    int i;
-    int found_bucket = 0;
+ 
     for (i = 0; i < num_buckets; i++) {
         if (!strcmp(hermes_buckets[i], name))
             found_bucket = 1;
@@ -375,30 +347,12 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     if (!found_bucket) {
         hermes_buckets[num_buckets++] = strdup(name);
     }
-        
-
-#if 0
-    /* Check for non-default FAPL */
-    if (H5P_FILE_ACCESS_DEFAULT != fapl_id) {
-
-        /* This step is for h5repart tool only. If user wants to change file driver from
-         * family to one that uses single files (hermes, etc.) while using h5repart, this
-         * private property should be set so that in the later step, the library can ignore
-         * the family driver information saved in the superblock.
-         */
-        if (H5P_exist_plist(plist, H5F_ACS_FAMILY_TO_SINGLE_NAME) > 0)
-            if (H5P_get(plist, H5F_ACS_FAMILY_TO_SINGLE_NAME, &file->fam_to_single) < 0)
-                HGOTO_ERROR(H5E_VFL, H5E_CANTGET, NULL, "can't get property of changing family to single")
-    } /* end if */
-#endif
 
     /* Set return value */
     ret_value = (H5FD_t *)file;
 
 done:
     if (NULL == ret_value) {
-        if (fd >= 0)
-            HDclose(fd);
         if (file)
             file = H5FL_FREE(H5FD_hermes_t, file);
     } /* end if */
@@ -414,8 +368,8 @@ done:
  * Return:      Success:    SUCCEED
  *              Failure:    FAIL, file not closed.
  *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -432,10 +386,6 @@ H5FD__hermes_close(H5FD_t *_file)
     HDassert(file);
 
     HermesBucketClose(file->bkt_handle);
-
-    /* Close the underlying file */
-    if (HDclose(file->fd) < 0)
-        HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
 
     /* Release the file info */
     file = H5FL_FREE(H5FD_hermes_t, file);
@@ -526,8 +476,8 @@ H5FD__hermes_query(const H5FD_t *_file, unsigned long *flags /* out */)
  *
  * Return:      The end-of-address marker.
  *
- * Programmer:  Robb Matzke
- *              Monday, August  2, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -551,8 +501,8 @@ H5FD__hermes_get_eoa(const H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type)
  *
  * Return:      SUCCEED (Can't fail)
  *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -579,8 +529,8 @@ H5FD__hermes_set_eoa(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, haddr_t addr
  * Return:      End of file address, the first address past the end of the
  *              "file", either the filesystem file or the HDF5 file.
  *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  *-------------------------------------------------------------------------
  */
@@ -598,7 +548,7 @@ H5FD__hermes_get_eof(const H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type)
 /*-------------------------------------------------------------------------
  * Function:       H5FD__hermes_get_handle
  *
- * Purpose:        Returns the file handle of hermes file driver.
+ * Purpose:        Returns the handle of Hermes bucket.
  *
  * Returns:        SUCCEED/FAIL
  *
@@ -619,7 +569,7 @@ H5FD__hermes_get_handle(H5FD_t *_file, hid_t H5_ATTR_UNUSED fapl, void **file_ha
     if (!file_handle)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "file handle not valid")
 
-    *file_handle = &(file->fd);
+//    *file_handle = &(file->fd);
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
@@ -764,6 +714,8 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
     printf("  Hermes VFD H5FD__hermes_write()\n");
     printf("    size = %ld\n", size);
     printf("    mem type is %d\n", type);
+    // mapping
+    // pages starts from addr with size
 
     HDassert(file && file->pub.cls);
     HDassert(buf);
@@ -775,62 +727,6 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
         HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu, size = %llu",
                     (unsigned long long)addr, (unsigned long long)size)
 
-#if 0
-#ifndef H5_HAVE_PREADWRITE
-    /* Seek to the correct location (if we don't have pwrite) */
-    if (addr != file->pos || OP_WRITE != file->op)
-        if (HDlseek(file->fd, (HDoff_t)addr, SEEK_SET) < 0)
-            HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to seek to proper position")
-#endif /* H5_HAVE_PREADWRITE */
-
-    /* Write the data, being careful of interrupted system calls and partial
-     * results
-     */
-    while (size > 0) {
-        h5_posix_io_t     bytes_in    = 0;  /* # of bytes to write  */
-        h5_posix_io_ret_t bytes_wrote = -1; /* # of bytes written   */
-
-        /* Trying to write more bytes than the return type can handle is
-         * undefined behavior in POSIX.
-         */
-        if (size > H5_POSIX_MAX_IO_BYTES)
-            bytes_in = H5_POSIX_MAX_IO_BYTES;
-        else
-            bytes_in = (h5_posix_io_t)size;
-
-        do {
-#ifdef H5_HAVE_PREADWRITE
-            bytes_wrote = HDpwrite(file->fd, buf, bytes_in, offset);
-            if (bytes_wrote > 0)
-                offset += bytes_wrote;
-#else
-            bytes_wrote = HDwrite(file->fd, buf, bytes_in);
-#endif /* H5_HAVE_PREADWRITE */
-        } while (-1 == bytes_wrote && EINTR == errno);
-
-        if (-1 == bytes_wrote) { /* error */
-            int    myerrno = errno;
-            time_t mytime  = HDtime(NULL);
-
-            offset = HDlseek(file->fd, (HDoff_t)0, SEEK_CUR);
-
-            HGOTO_ERROR(H5E_IO, H5E_WRITEERROR, FAIL,
-                        "file write failed: time = %s, filename = '%s', file descriptor = %d, errno = %d, "
-                        "error message = '%s', buf = %p, total write size = %llu, bytes this sub-write = "
-                        "%llu, bytes actually written = %llu, offset = %llu",
-                        HDctime(&mytime), file->bktname, file->fd, myerrno, HDstrerror(myerrno), buf,
-                        (unsigned long long)size, (unsigned long long)bytes_in,
-                        (unsigned long long)bytes_wrote, (unsigned long long)offset);
-        } /* end if */
-
-        HDassert(bytes_wrote > 0);
-        HDassert((size_t)bytes_wrote <= size);
-
-        size -= (size_t)bytes_wrote;
-        addr += (haddr_t)bytes_wrote;
-        buf = (const char *)buf + bytes_wrote;
-    } /* end while */
-#endif
 
     /* Update current position and eof */
     file->pos = addr;
@@ -901,8 +797,8 @@ H5FD__hermes_truncate(H5FD_t *_file, hid_t H5_ATTR_UNUSED dxpl_id, hbool_t H5_AT
         if (0 == bError)
             HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
 #else  /* H5_HAVE_WIN32_API */
-        if (-1 == HDftruncate(file->fd, (HDoff_t)file->eoa))
-            HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
+ //       if (-1 == HDftruncate(file->fd, (HDoff_t)file->eoa))
+ //           HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
 #endif /* H5_HAVE_WIN32_API */
 
         /* Update the eof value */
