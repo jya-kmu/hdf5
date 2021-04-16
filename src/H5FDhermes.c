@@ -32,6 +32,12 @@
 #include "H5MMprivate.h" /* Memory management        */
 #include "H5Pprivate.h"  /* Property lists           */
 
+
+#ifdef H5_HAVE_HERMES_VFD
+
+/* Necessary hermes headers */
+#include "hermes_wrapper.h"
+
 /* The driver identification number, initialized at runtime */
 static hid_t H5FD_HERMES_g = 0;
 
@@ -41,7 +47,14 @@ static htri_t hermes_initialized = FAIL;
 /**
  * Define kPageSize mapping.
  */
-const size_t kPageSize = 1024 * 1024;
+const size_t kPageSize = 4 * 1024;
+
+unsigned char buffer_page_g[kPageSize];
+
+/**
+ * Define length of blob name, which is converted from page index
+ */
+const size_t len_blob_name = 10;
 
 /**
  * kHermesConf env variable is used to define path to kHermesConf in adapters.
@@ -49,20 +62,7 @@ const size_t kPageSize = 1024 * 1024;
  */
 const char *kHermesConf = "HERMES_CONF";
 
-static char **hermes_buckets;
-static size_t num_buckets;
-
-/* The description of a bucket belonging to this driver. The 'eoa' and 'eof'
- * determine the amount of hdf5 address space in use and the high-water mark
- * of the file (the current size of the underlying filesystem file). The
- * 'pos' value is used to eliminate file position updates when they would be a
- * no-op. Unfortunately we've found systems that use separate file position
- * indicators for reading and writing so the lseek can only be eliminated if
- * the current operation is the same as the previous operation.  When opening
- * a file the 'eof' will be set to the current file size, `eoa' will be set
- * to zero, 'pos' will be set to H5F_ADDR_UNDEF (as it is when an error
- * occurs), and 'op' will be set to H5F_OP_UNKNOWN.
- */
+/* The description of a file/bucket belonging to this driver. */
 typedef struct H5FD_hermes_t {
     H5FD_t         pub; /* public stuff, must be first      */
     haddr_t        eoa; /* end of allocated region          */
@@ -70,12 +70,9 @@ typedef struct H5FD_hermes_t {
     haddr_t        pos; /* current file I/O position        */
     H5FD_file_op_t op;  /* last operation                   */
     char           bktname[H5FD_MAX_FILENAME_LEN]; /* Copy of file name from open operation */
-    int            o_flags;     /* Flags for open() call    */
-    off_t          st_size;        /* total size, in bytes */
-    off_t          st_ptr;         /* Current ptr of FILE */
-    int32_t        ref_count;        /* # of time process opens a file */
+    int            o_flags; /* Flags for open() call    */
     BucketClass   *bkt_handle;
-    char **st_blobs;         /* Blobs access in the bucket */
+    unsigned char *page_buf;
 } H5FD_hermes_t;
 
 /*
@@ -108,46 +105,44 @@ static herr_t  H5FD__hermes_query(const H5FD_t *_f1, unsigned long *flags);
 static haddr_t H5FD__hermes_get_eoa(const H5FD_t *_file, H5FD_mem_t type);
 static herr_t  H5FD__hermes_set_eoa(H5FD_t *_file, H5FD_mem_t type, haddr_t addr);
 static haddr_t H5FD__hermes_get_eof(const H5FD_t *_file, H5FD_mem_t type);
-static herr_t  H5FD__hermes_get_handle(H5FD_t *_file, hid_t fapl, void **file_handle);
 static herr_t  H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t type, hid_t fapl_id, haddr_t addr, size_t size,
                                void *buf);
 static herr_t  H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t type, hid_t fapl_id, haddr_t addr, size_t size,
                                 const void *buf);
-static herr_t  H5FD__hermes_truncate(H5FD_t *_file, hid_t dxpl_id, hbool_t closing);
 
 static const H5FD_class_t H5FD_hermes_g = {
-    "hermes",                /* name                 */
-    MAXADDR,                 /* maxaddr              */
-    H5F_CLOSE_WEAK,          /* fc_degree            */
-    H5FD__hermes_term,       /* terminate            */
-    NULL,                    /* sb_size              */
-    NULL,                    /* sb_encode            */
-    NULL,                    /* sb_decode            */
-    0,                       /* fapl_size            */
-    NULL,                    /* fapl_get             */
-    NULL,                    /* fapl_copy            */
-    NULL,                    /* fapl_free            */
-    0,                       /* dxpl_size            */
-    NULL,                    /* dxpl_copy            */
-    NULL,                    /* dxpl_free            */
-    H5FD__hermes_open,       /* open                 */
-    H5FD__hermes_close,      /* close                */
-    H5FD__hermes_cmp,        /* cmp                  */
-    H5FD__hermes_query,      /* query                */
-    NULL,                    /* get_type_map         */
-    NULL,                    /* alloc                */
-    NULL,                    /* free                 */
-    H5FD__hermes_get_eoa,    /* get_eoa              */
-    H5FD__hermes_set_eoa,    /* set_eoa              */
-    H5FD__hermes_get_eof,    /* get_eof              */
-    H5FD__hermes_get_handle, /* get_handle           */
-    H5FD__hermes_read,       /* read                 */
-    H5FD__hermes_write,      /* write                */
-    NULL,                    /* flush                */
-    H5FD__hermes_truncate,   /* truncate             */
-    NULL,                    /* lock                 */
-    NULL,                    /* unlock               */
-    H5FD_FLMAP_DICHOTOMY     /* fl_map               */
+    "hermes",                  /* name                 */
+    MAXADDR,                   /* maxaddr              */
+    H5F_CLOSE_STRONG,          /* fc_degree            */
+    H5FD__hermes_term,         /* terminate            */
+    NULL,                      /* sb_size              */
+    NULL,                      /* sb_encode            */
+    NULL,                      /* sb_decode            */
+    0,                         /* fapl_size            */
+    NULL,                      /* fapl_get             */
+    NULL,                      /* fapl_copy            */
+    NULL,                      /* fapl_free            */
+    0,                         /* dxpl_size            */
+    NULL,                      /* dxpl_copy            */
+    NULL,                      /* dxpl_free            */
+    H5FD__hermes_open,         /* open                 */
+    H5FD__hermes_close,        /* close                */
+    H5FD__hermes_cmp,          /* cmp                  */
+    H5FD__hermes_query,        /* query                */
+    NULL,                      /* get_type_map         */
+    NULL,                      /* alloc                */
+    NULL,                      /* free                 */
+    H5FD__hermes_get_eoa,      /* get_eoa              */
+    H5FD__hermes_set_eoa,      /* set_eoa              */
+    H5FD__hermes_get_eof,      /* get_eof              */
+    NULL,                      /* get_handle           */
+    H5FD__hermes_read,         /* read                 */
+    H5FD__hermes_write,        /* write                */
+    NULL,                      /* flush                */
+    NULL,                      /* truncate             */
+    NULL,                      /* lock                 */
+    NULL,                      /* unlock               */
+    H5FD_FLMAP_DICHOTOMY       /* fl_map               */
 };
 
 /* Declare a free list to manage the H5FD_hermes_t struct */
@@ -165,18 +160,16 @@ H5FL_DEFINE_STATIC(H5FD_hermes_t);
 static herr_t
 H5FD__init_package(void)
 {
-    char * lock_env_var = NULL; /* Environment variable pointer */
     herr_t ret_value    = SUCCEED;
 
     FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__init_package()\n");
 
     if (H5FD_hermes_init() < 0)
         HGOTO_ERROR(H5E_VFL, H5E_CANTINIT, FAIL, "unable to initialize hermes VFD")
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
-} /* H5FD__init_package() */
+} /* end H5FD__init_package() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5FD_hermes_init
@@ -187,9 +180,6 @@ done:
  * Return:      Success:    The driver ID for the hermes driver
  *              Failure:    H5I_INVALID_HID
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 hid_t
@@ -198,11 +188,10 @@ H5FD_hermes_init(void)
     hid_t ret_value = H5I_INVALID_HID; /* Return value */
 
     FUNC_ENTER_NOAPI(H5I_INVALID_HID)
-    printf("  Hermes VFD H5FD_hermes_init()\n");
 
     if (H5I_VFL != H5I_get_type(H5FD_HERMES_g))
         H5FD_HERMES_g = H5FD_register(&H5FD_hermes_g, sizeof(H5FD_class_t), FALSE);
-    
+
     /* Set return value */
     ret_value = H5FD_HERMES_g;
 
@@ -217,16 +206,12 @@ done:
  *
  * Returns:     SUCCEED (Can't fail)
  *
- * Programmer:  Kimmy My
- *              April 2021
- *
  *---------------------------------------------------------------------------
  */
 static herr_t
 H5FD__hermes_term(void)
 {
     FUNC_ENTER_STATIC_NOERR
-    printf("  Hermes VFD H5FD__hermes_term()\n");
 
     /* Reset VFL ID */
     H5FD_HERMES_g = 0;
@@ -243,9 +228,6 @@ H5FD__hermes_term(void)
  *
  * Return:      SUCCEED/FAIL
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 herr_t
@@ -256,7 +238,6 @@ H5Pset_fapl_hermes(hid_t fapl_id)
 
     FUNC_ENTER_API(FAIL)
     H5TRACE1("e", "i", fapl_id);
-    printf("  Hermes VFD H5Pset_fapl_hermes()\n");
 
     if (NULL == (plist = H5P_object_verify(fapl_id, H5P_FILE_ACCESS)))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list")
@@ -275,24 +256,18 @@ done:
  * Return:      Success:    A pointer to a new bucket data structure.
  *              Failure:    NULL
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 static H5FD_t *
 H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
 {
-    H5FD_hermes_t *file = NULL; /* hermes VFD info            */
-    int          o_flags;     /* Flags for open() call    */
+    H5FD_hermes_t  *file = NULL; /* hermes VFD info            */
+    int             o_flags;     /* Flags for open() call    */
     H5P_genplist_t *plist;            /* Property list pointer */
-    char *hermes_config = NULL;
-    int i;
-    int found_bucket = 0;
-    H5FD_t *        ret_value = NULL; /* Return value */
+    char           *hermes_config = NULL;
+    H5FD_t         *ret_value = NULL; /* Return value */
 
     FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__hermes_open()\n");
 
     /* Sanity check on file offsets */
     HDcompile_assert(sizeof(HDoff_t) >= sizeof(size_t));
@@ -317,12 +292,11 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     /* Initialize Hermes */
     if ((H5OPEN hermes_initialized) == FAIL) {
         hermes_config = HDgetenv(kHermesConf);
-        printf("hermes_config: %s\n", hermes_config);
-        if (HermesInitHermes(hermes_config) < 0)
+        if (HermesInitHermes(hermes_config) < 0) {
             HGOTO_ERROR(H5E_SYM, H5E_UNINITIALIZED, NULL, "Hermes initialization failed")
+        }
         else {
             hermes_initialized = TRUE;
-            hermes_buckets = malloc(sizeof(char*));
         }
     }
 
@@ -339,14 +313,9 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->bktname[sizeof(file->bktname) - 1] = '\0';
 
     file->bkt_handle = HermesBucketCreate(name);
- 
-    for (i = 0; i < num_buckets; i++) {
-        if (!strcmp(hermes_buckets[i], name))
-            found_bucket = 1;
-    }
-    if (!found_bucket) {
-        hermes_buckets[num_buckets++] = strdup(name);
-    }
+
+    /* Hardcoded now */
+    file->page_buf = &buffer_page_g[0];
 
     /* Set return value */
     ret_value = (H5FD_t *)file;
@@ -368,19 +337,15 @@ done:
  * Return:      Success:    SUCCEED
  *              Failure:    FAIL, file not closed.
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 static herr_t
 H5FD__hermes_close(H5FD_t *_file)
 {
-    H5FD_hermes_t *file      = (H5FD_hermes_t *)_file;
-    herr_t       ret_value = SUCCEED; /* Return value */
+    H5FD_hermes_t *file = (H5FD_hermes_t *)_file;
+    herr_t ret_value = SUCCEED; /* Return value */
 
-    FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__hermes_close()\n");
+    FUNC_ENTER_STATIC_NOERR
 
     /* Sanity check */
     HDassert(file);
@@ -390,22 +355,18 @@ H5FD__hermes_close(H5FD_t *_file)
     /* Release the file info */
     file = H5FL_FREE(H5FD_hermes_t, file);
 
-done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5FD__hermes_close() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5FD__hermes_cmp
  *
- * Purpose:     Compares two files belonging to this driver using an
+ * Purpose:     Compares two buckets belonging to this driver using an
  *              arbitrary (but consistent) ordering.
  *
  * Return:      Success:    A value like strcmp()
  *              Failure:    never fails (arguments were checked by the
  *                          caller).
- *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
  *
  *-------------------------------------------------------------------------
  */
@@ -414,12 +375,12 @@ H5FD__hermes_cmp(const H5FD_t *_f1, const H5FD_t *_f2)
 {
     const H5FD_hermes_t *f1        = (const H5FD_hermes_t *)_f1;
     const H5FD_hermes_t *f2        = (const H5FD_hermes_t *)_f2;
-    int                ret_value = 0;
+    int                  ret_value = 0;
 
     FUNC_ENTER_STATIC_NOERR
-    printf("  Hermes VFD H5FD__hermes_cmp()\n");
 
-done:
+    ret_value = strcmp(f1->bktname, f2->bktname);
+
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5FD__hermes_cmp() */
 
@@ -431,18 +392,12 @@ done:
  *
  * Return:      SUCCEED (Can't fail)
  *
- * Programmer:  Quincey Koziol
- *              Friday, August 25, 2000
- *
  *-------------------------------------------------------------------------
  */
 static herr_t
 H5FD__hermes_query(const H5FD_t *_file, unsigned long *flags /* out */)
 {
-    const H5FD_hermes_t *file = (const H5FD_hermes_t *)_file; /* hermes VFD info */
-
     FUNC_ENTER_STATIC_NOERR
-    printf("  Hermes VFD H5FD__hermes_query()\n");
 
     /* Set the VFL feature flags that this driver supports */
     /* Notice: the Mirror VFD Writer currently uses only the hermes driver as
@@ -453,15 +408,6 @@ H5FD__hermes_query(const H5FD_t *_file, unsigned long *flags /* out */)
      */
     if (flags) {
         *flags = 0;
-        *flags |= H5FD_FEAT_AGGREGATE_METADATA;  /* OK to aggregate metadata allocations  */
-        *flags |= H5FD_FEAT_ACCUMULATE_METADATA; /* OK to accumulate metadata for faster writes */
-        *flags |= H5FD_FEAT_DATA_SIEVE; /* OK to perform data sieving for faster raw data reads & writes    */
-        *flags |= H5FD_FEAT_AGGREGATE_SMALLDATA; /* OK to aggregate "small" raw data allocations */
-        *flags |= H5FD_FEAT_POSIX_COMPAT_HANDLE; /* get_handle callback returns a POSIX file descriptor */
-        *flags |=
-            H5FD_FEAT_SUPPORTS_SWMR_IO; /* VFD supports the single-writer/multiple-readers (SWMR) pattern   */
-        *flags |= H5FD_FEAT_DEFAULT_VFD_COMPATIBLE; /* VFD creates a file which can be opened with the default
-                                                       VFD      */
     }                                            /* end if */
 
     FUNC_LEAVE_NOAPI(SUCCEED)
@@ -476,9 +422,6 @@ H5FD__hermes_query(const H5FD_t *_file, unsigned long *flags /* out */)
  *
  * Return:      The end-of-address marker.
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 static haddr_t
@@ -487,7 +430,6 @@ H5FD__hermes_get_eoa(const H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type)
     const H5FD_hermes_t *file = (const H5FD_hermes_t *)_file;
 
     FUNC_ENTER_STATIC_NOERR
-    printf("  Hermes VFD H5FD__hermes_get_eoa(): eoa = %lu\n", file->eoa);
 
     FUNC_LEAVE_NOAPI(file->eoa)
 } /* end H5FD__hermes_get_eoa() */
@@ -501,9 +443,6 @@ H5FD__hermes_get_eoa(const H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type)
  *
  * Return:      SUCCEED (Can't fail)
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -512,8 +451,7 @@ H5FD__hermes_set_eoa(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, haddr_t addr
     H5FD_hermes_t *file = (H5FD_hermes_t *)_file;
 
     FUNC_ENTER_STATIC_NOERR
-    printf("  Hermes VFD H5FD__hermes_set_eoa(): eoa = %lu\n", addr);
-    
+
     file->eoa = addr;
 
     FUNC_LEAVE_NOAPI(SUCCEED)
@@ -529,9 +467,6 @@ H5FD__hermes_set_eoa(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, haddr_t addr
  * Return:      End of file address, the first address past the end of the
  *              "file", either the filesystem file or the HDF5 file.
  *
- * Programmer:  Kimmy Mu
- *              April 2021
- *
  *-------------------------------------------------------------------------
  */
 static haddr_t
@@ -540,54 +475,23 @@ H5FD__hermes_get_eof(const H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type)
     const H5FD_hermes_t *file = (const H5FD_hermes_t *)_file;
 
     FUNC_ENTER_STATIC_NOERR
-    printf("  Hermes VFD H5FD__hermes_get_eof(): eof = %lu\n", file->eof);
 
     FUNC_LEAVE_NOAPI(file->eof)
 } /* end H5FD__hermes_get_eof() */
-
-/*-------------------------------------------------------------------------
- * Function:       H5FD__hermes_get_handle
- *
- * Purpose:        Returns the handle of Hermes bucket.
- *
- * Returns:        SUCCEED/FAIL
- *
- * Programmer:     Raymond Lu
- *                 Sept. 16, 2002
- *
- *-------------------------------------------------------------------------
- */
-static herr_t
-H5FD__hermes_get_handle(H5FD_t *_file, hid_t H5_ATTR_UNUSED fapl, void **file_handle)
-{
-    H5FD_hermes_t *file      = (H5FD_hermes_t *)_file;
-    herr_t       ret_value = SUCCEED;
-
-    FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__hermes_get_handle()\n");
-
-    if (!file_handle)
-        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "file handle not valid")
-
-//    *file_handle = &(file->fd);
-
-done:
-    FUNC_LEAVE_NOAPI(ret_value)
-} /* end H5FD__hermes_get_handle() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5FD__hermes_read
  *
  * Purpose:     Reads SIZE bytes of data from FILE beginning at address ADDR
  *              into buffer BUF according to data transfer properties in
- *              DXPL_ID.
+ *              DXPL_ID. Determine the number of file pages affected by this
+ *              call from ADDR and SIZE. Utilize transfer buffer PAGE_BUF to
+ *              read the data from Blobs. Exercise care for the first and last
+ *              pages to prevent overwriting existing data.
  *
  * Return:      Success:    SUCCEED. Result is stored in caller-supplied
  *                          buffer BUF.
  *              Failure:    FAIL, Contents of buffer BUF are undefined.
- *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
  *
  *-------------------------------------------------------------------------
  */
@@ -596,11 +500,15 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
                 size_t size, void *buf /*out*/)
 {
     H5FD_hermes_t *file      = (H5FD_hermes_t *)_file;
-    HDoff_t      offset    = (HDoff_t)addr;
-    herr_t       ret_value = SUCCEED; /* Return value */
+    size_t         num_pages; /* Number of pages of transfer buffer */
+    size_t         start_page_index; /* First page index of tranfer buffer */
+    size_t         end_page_index; /* End page index of tranfer buffer */
+    size_t         transfer_size = 0;
+    size_t         k;
+    haddr_t        addr_end = addr+size-1;
+    herr_t         ret_value = SUCCEED; /* Return value */
 
     FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__hermes_read()\n");
 
     HDassert(file && file->pub.cls);
     HDassert(buf);
@@ -610,72 +518,63 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "addr undefined, addr = %llu", (unsigned long long)addr)
     if (REGION_OVERFLOW(addr, size))
         HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu", (unsigned long long)addr)
+    if (NULL == file->page_buf)
+        HGOTO_ERROR(H5E_INTERNAL, H5E_UNINITIALIZED, FAIL, "transfer buffer not initialized")
 
-#if 0
-#ifndef H5_HAVE_PREADWRITE
-    /* Seek to the correct location (if we don't have pread) */
-    if (addr != file->pos || OP_READ != file->op)
-        if (HDlseek(file->fd, (HDoff_t)addr, SEEK_SET) < 0)
-            HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to seek to proper position")
-#endif /* H5_HAVE_PREADWRITE */
+    start_page_index = addr/kPageSize;
+    end_page_index = (addr+size)/kPageSize;
+    num_pages = end_page_index - start_page_index + 1;
 
-    /* Read data, being careful of interrupted system calls, partial results,
-     * and the end of the file.
-     */
-    while (size > 0) {
-        h5_posix_io_t     bytes_in   = 0;  /* # of bytes to read       */
-        h5_posix_io_ret_t bytes_read = -1; /* # of bytes actually read */
+    for (k=start_page_index; k<=end_page_index; ++k) {
+        char k_blob[len_blob_name];
+        snprintf(k_blob, 6, "%zu\n", k);
+        /* Check if this blob exists */
+        bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, k_blob);
+        /* Read blob back to transfer buffer */
+        if (!blob_exists)
+            HGOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "not able to retrieve Blob %zu", k)
+        /* Read blob back to transfer buffer */
+        HermesBucketGet(file->bkt_handle, k_blob, kPageSize, file->page_buf);
 
-        /* Trying to read more bytes than the return type can handle is
-         * undefined behavior in POSIX.
-         */
-        if (size > H5_POSIX_MAX_IO_BYTES)
-            bytes_in = H5_POSIX_MAX_IO_BYTES;
-        else
-            bytes_in = (h5_posix_io_t)size;
+        /* Check if addr is in the range of (k*kPageSize, (k+1)*kPageSize) */
+        /* NOTE: The range does NOT include the start address of page k,
+           but includes the end address of page k */
+        if (addr > k*kPageSize && addr < (k+1)*kPageSize) {
+            /* Calculate the starting address of transfer buffer update within page k */
+            size_t offset = addr - k*kPageSize;
+            HDassert(offset > 0);
 
-        do {
-#ifdef H5_HAVE_PREADWRITE
-            bytes_read = HDpread(file->fd, buf, bytes_in, offset);
-            if (bytes_read > 0)
-                offset += bytes_read;
-#else
-            bytes_read  = HDread(file->fd, buf, bytes_in);
-#endif /* H5_HAVE_PREADWRITE */
-        } while (-1 == bytes_read && EINTR == errno);
-
-        if (-1 == bytes_read) { /* error */
-            int    myerrno = errno;
-            time_t mytime  = HDtime(NULL);
-
-            offset = HDlseek(file->fd, (HDoff_t)0, SEEK_CUR);
-
-            HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
-                        "file read failed: time = %s, filename = '%s', file descriptor = %d, errno = %d, "
-                        "error message = '%s', buf = %p, total read size = %llu, bytes this sub-read = %llu, "
-                        "bytes actually read = %llu, offset = %llu",
-                        HDctime(&mytime), file->bktname, file->fd, myerrno, HDstrerror(myerrno), buf,
-                        (unsigned long long)size, (unsigned long long)bytes_in,
-                        (unsigned long long)bytes_read, (unsigned long long)offset);
-        } /* end if */
-
-        if (0 == bytes_read) {
-            /* end of file but not end of format address space */
-            HDmemset(buf, 0, size);
-            break;
-        } /* end if */
-
-        HDassert(bytes_read >= 0);
-        HDassert((size_t)bytes_read <= size);
-
-        size -= (size_t)bytes_read;
-        addr += (haddr_t)bytes_read;
-        buf = (char *)buf + bytes_read;
-    } /* end while */
-#endif
+            /* Copy update to BUF */
+            /* addr+size is within the same page (only one page) */
+            if (addr_end <= (k+1)*kPageSize-1) {
+                memcpy(buf, file->page_buf+offset, size);
+                transfer_size += size;
+            }
+            /* More than one page */
+            else {
+                /* Copy data from addr to the end of the address in page k */
+                memcpy(buf, file->page_buf+offset, (k+1)*kPageSize-addr);
+                transfer_size += (k+1)*kPageSize-addr;
+            }
+        }
+        /* Check if addr_end is in the range of [k*kPageSize, (k+1)*kPageSize-1) */
+        /* NOTE: The range includes the start address of page k,
+           but does NOT include the end address of page k */
+        else if (addr_end >= k*kPageSize && addr_end < (k+1)*kPageSize-1) {
+            /* Update transfer buffer */
+            memcpy(buf+transfer_size, file->page_buf, addr_end-k*kPageSize+1);
+            transfer_size += addr_end-k*kPageSize+1;
+        }
+        /* Page/Blob k is within the range of (addr, addr+size) */
+        else if (addr <= k*kPageSize && addr_end >= (k+1)*kPageSize-1) {
+            /* Update transfer buffer */
+            memcpy(buf+transfer_size, file->page_buf, kPageSize);
+            transfer_size += kPageSize;
+        }
+    }
 
     /* Update current position */
-    file->pos = addr;
+    file->pos = addr+size;
     file->op  = OP_READ;
 
 done:
@@ -691,14 +590,14 @@ done:
 /*-------------------------------------------------------------------------
  * Function:    H5FD__hermes_write
  *
- * Purpose:     Writes SIZE bytes of data to FILE beginning at address ADDR
- *              from buffer BUF according to data transfer properties in
- *              DXPL_ID.
+ * Purpose:     Writes SIZE bytes of data contained in buffer BUF to Hermes
+ *              buffering system according to data transfer properties in
+ *              DXPL_ID. Determine the number of file pages affected by this
+ *              call from ADDR and SIZE. Utilize transfer buffer PAGE_BUF to
+ *              put the data into Blobs. Exercise care for the first and last
+ *              pages to prevent overwriting existing data.
  *
  * Return:      SUCCEED/FAIL
- *
- * Programmer:  Robb Matzke
- *              Thursday, July 29, 1999
  *
  *-------------------------------------------------------------------------
  */
@@ -707,15 +606,15 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
                  size_t size, const void *buf)
 {
     H5FD_hermes_t *file      = (H5FD_hermes_t *)_file;
-    HDoff_t      offset    = (HDoff_t)addr;
-    herr_t       ret_value = SUCCEED; /* Return value */
+    size_t         num_pages; /* Number of pages of transfer buffer */
+    size_t         start_page_index; /* First page index of tranfer buffer */
+    size_t         end_page_index; /* End page index of tranfer buffer */
+    size_t         transfer_size = 0;
+    size_t         k;
+    haddr_t        addr_end = addr+size-1;
+    herr_t         ret_value = SUCCEED; /* Return value */
 
     FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__hermes_write()\n");
-    printf("    size = %ld\n", size);
-    printf("    mem type is %d\n", type);
-    // mapping
-    // pages starts from addr with size
 
     HDassert(file && file->pub.cls);
     HDassert(buf);
@@ -726,10 +625,71 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
     if (REGION_OVERFLOW(addr, size))
         HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu, size = %llu",
                     (unsigned long long)addr, (unsigned long long)size)
+    if (NULL == file->page_buf)
+        HGOTO_ERROR(H5E_INTERNAL, H5E_UNINITIALIZED, FAIL, "transfer buffer not initialized")
 
+    start_page_index = addr/kPageSize;
+    end_page_index = (addr+size)/kPageSize;
+    num_pages = end_page_index - start_page_index + 1;
+
+    /* Assume only using one page now */
+    for (k=start_page_index; k<=end_page_index; ++k) {
+        char k_blob[50];
+        snprintf(k_blob, 6, "%zu\n", k);
+        /* Check if addr is in the range of (k*kPageSize, (k+1)*kPageSize) */
+        /* NOTE: The range does NOT include the start address of page k,
+           but includes the end address of page k */
+        if (addr > k*kPageSize && addr < (k+1)*kPageSize) {
+            /* Check if this blob exists */
+            bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, k_blob);
+            /* Read blob back to transfer buffer */
+            if (blob_exists) {
+                HermesBucketGet(file->bkt_handle, k_blob, kPageSize, file->page_buf);
+            }
+            /* Calculate the starting address of transfer buffer update within page k */
+            size_t offset = addr - k*kPageSize;
+            HDassert(offset > 0);
+
+            /* Update transfer buffer */
+            /* addr+size is within the same page (only one page) */
+            if (addr_end <= (k+1)*kPageSize-1) {
+                memcpy(file->page_buf+offset, buf+transfer_size, size);
+                transfer_size += size;
+            }
+            /* More than one page */
+            else {
+                /* Copy data from addr to the end of the address in page k */
+                memcpy(file->page_buf+offset, buf+transfer_size, (k+1)*kPageSize-addr);
+                transfer_size += (k+1)*kPageSize-addr;
+            }
+        }
+        /* Check if addr_end is in the range of [k*kPageSize, (k+1)*kPageSize-1) */
+        /* NOTE: The range includes the start address of page k,
+           but does NOT include the end address of page k */
+        else if (addr_end >= k*kPageSize && addr_end < (k+1)*kPageSize-1) {
+            /* Check if this blob exists */
+            bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, k_blob);
+            /* Read blob back */
+            if (blob_exists) {
+                unsigned char *put_data_ptr = (unsigned char *)file->page_buf;
+                HermesBucketGet(file->bkt_handle, k_blob, kPageSize, file->page_buf);
+            }
+            /* Update transfer buffer */
+            memcpy(file->page_buf, buf+transfer_size, addr_end-k*kPageSize+1);
+            transfer_size += addr_end-k*kPageSize+1;
+        }
+        /* Page/Blob k is within the range of (addr, addr+size) */
+        else if (addr <= k*kPageSize && addr_end >= (k+1)*kPageSize-1) {
+            /* Update transfer buffer */
+            memcpy(file->page_buf, buf+transfer_size, kPageSize);
+            transfer_size += kPageSize;
+        }
+        /* Write Blob k to Hermes buffering system */
+        HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, kPageSize);
+    }
 
     /* Update current position and eof */
-    file->pos = addr;
+    file->pos = addr+size;
     file->op  = OP_WRITE;
     if (file->pos > file->eof)
         file->eof = file->pos;
@@ -744,71 +704,4 @@ done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5FD__hermes_write() */
 
-/*-------------------------------------------------------------------------
- * Function:    H5FD__hermes_truncate
- *
- * Purpose:     Makes sure that the true file size is the same (or larger)
- *              than the end-of-address.
- *
- * Return:      SUCCEED/FAIL
- *
- * Programmer:  Robb Matzke
- *              Wednesday, August  4, 1999
- *
- *-------------------------------------------------------------------------
- */
-static herr_t
-H5FD__hermes_truncate(H5FD_t *_file, hid_t H5_ATTR_UNUSED dxpl_id, hbool_t H5_ATTR_UNUSED closing)
-{
-    H5FD_hermes_t *file      = (H5FD_hermes_t *)_file;
-    herr_t       ret_value = SUCCEED; /* Return value */
-
-    FUNC_ENTER_STATIC
-    printf("  Hermes VFD H5FD__hermes_truncate()\n");
-
-    HDassert(file);
-
-    /* Extend the file to make sure it's large enough */
-    if (!H5F_addr_eq(file->eoa, file->eof)) {
-#ifdef H5_HAVE_WIN32_API
-        LARGE_INTEGER li;       /* 64-bit (union) integer for SetFilePointer() call */
-        DWORD         dwPtrLow; /* Low-order pointer bits from SetFilePointer()
-                                 * Only used as an error code here.
-                                 */
-        DWORD dwError;          /* DWORD error code from GetLastError() */
-        BOOL  bError;           /* Boolean error flag */
-
-        /* Windows uses this odd QuadPart union for 32/64-bit portability */
-        li.QuadPart = (__int64)file->eoa;
-
-        /* Extend the file to make sure it's large enough.
-         *
-         * Since INVALID_SET_FILE_POINTER can technically be a valid return value
-         * from SetFilePointer(), we also need to check GetLastError().
-         */
-        dwPtrLow = SetFilePointer(file->hFile, li.LowPart, &li.HighPart, FILE_BEGIN);
-        if (INVALID_SET_FILE_POINTER == dwPtrLow) {
-            dwError = GetLastError();
-            if (dwError != NO_ERROR)
-                HGOTO_ERROR(H5E_FILE, H5E_FILEOPEN, FAIL, "unable to set file pointer")
-        }
-
-        bError = SetEndOfFile(file->hFile);
-        if (0 == bError)
-            HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
-#else  /* H5_HAVE_WIN32_API */
- //       if (-1 == HDftruncate(file->fd, (HDoff_t)file->eoa))
- //           HSYS_GOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "unable to extend file properly")
-#endif /* H5_HAVE_WIN32_API */
-
-        /* Update the eof value */
-        file->eof = file->eoa;
-
-        /* Reset last file I/O information */
-        file->pos = HADDR_UNDEF;
-        file->op  = OP_UNKNOWN;
-    } /* end if */
-
-done:
-    FUNC_LEAVE_NOAPI(ret_value)
-} /* end H5FD__hermes_truncate() */
+#endif /* H5_HAVE_HERMES_VFD */

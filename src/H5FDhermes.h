@@ -12,16 +12,13 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * Programmer:  Robb Matzke
- *              Monday, August  2, 1999
+ * Programmer:  Kimmy Mu
+ *              April 2021
  *
  * Purpose: The public header file for the Hermes driver.
  */
 #ifndef H5FDhermes_H
 #define H5FDhermes_H
-
-/* Necessary hermes headers */
-#include "hermes_wrapper.h"
 
 #define H5FD_HERMES (H5FD_hermes_init())
 
@@ -29,11 +26,11 @@
 extern "C" {
 #endif
 
-H5_DLL hid_t  H5FD_hermes_init(void);
+H5_DLL hid_t H5FD_hermes_init(void);
 H5_DLL herr_t H5Pset_fapl_hermes(hid_t fapl_id);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif /* end H5FDhermes_H */

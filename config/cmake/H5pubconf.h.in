@@ -191,6 +191,9 @@
 /* Define to 1 if you have the <hdfs.h> header file. */
 #cmakedefine H5_HAVE_HDFS_H @H5_HAVE_HDFS_H@
 
+/* Define to 1 if we can build the Hermes VFD. */
+#cmakedefine H5_HAVE_HERMES_VFD @H5_HAVE_HERMES_VFD@
+
 /* Define if the compiler understands inline */
 #cmakedefine H5_HAVE_INLINE @H5_HAVE_INLINE@
 
