@@ -47,7 +47,7 @@ static htri_t hermes_initialized = FAIL;
 /**
  * Define kPageSize mapping.
  */
-const size_t kPageSize = 4 * 1024;
+#define kPageSize 1048576
 
 unsigned char buffer_page_g[kPageSize];
 
