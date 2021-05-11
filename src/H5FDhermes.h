@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 H5_DLL hid_t H5FD_hermes_init(void);
-H5_DLL herr_t H5Pset_fapl_hermes(hid_t fapl_id);
+H5_DLL herr_t H5Pset_fapl_hermes(hid_t fapl_id, hbool_t persistence, size_t page_size);
 
 #ifdef __cplusplus
 }
