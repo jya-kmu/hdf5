@@ -495,12 +495,12 @@ H5FD__hermes_close(H5FD_t *_file)
          }
          if (fclose(file->fp) < 0)
              HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
-    }
 
-    if (file->ref_count > 1)
-        HermesBucketClose(file->bkt_handle);
-    else
-        HermesBucketDestroy(file->bkt_handle);
+         if (file->ref_count == 1)
+             HermesBucketDestroy(file->bkt_handle);
+         else
+             HermesBucketClose(file->bkt_handle);
+    }
 
     /* Release the file info */
     file = H5FL_FREE(H5FD_hermes_t, file);
@@ -686,6 +686,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
     num_pages = end_page_index - start_page_index + 1;
 
     for (k = start_page_index; k <= end_page_index; ++k) {
+        size_t bytes_in;
         char k_blob[LEN_BLOB_NAME];
         snprintf(k_blob, sizeof(k_blob), "%zu\n", k);
         /* Check if this blob exists */
@@ -699,59 +700,57 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
             size_t offset = addr - k*blob_size;
             HDassert(offset > 0);
 
+            if (addr_end <= (k+1)*blob_size-1)
+                bytes_in = size;
+            else
+                bytes_in = (k+1)*blob_size-addr;
+
             if (!blob_exists) {
                 /* Seek to the correct file position. */
                 if (fseek(file->fp, addr, SEEK_SET) != 0)
                     HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-                size_t bytes_read = fread(file->page_buf, sizeof(unsigned char),
-                                          blob_size, file->fp);
-                if (bytes_read != blob_size)
+
+                size_t bytes_read = fread(buf, sizeof(unsigned char),
+                                          bytes_in, file->fp);
+                if (bytes_read != bytes_in)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
             }
             else {
                 /* Read blob back to transfer buffer */
                 HermesBucketGet(file->bkt_handle, k_blob, blob_size, file->page_buf);
-            }
 
-            /* Copy update to BUF */
-            /* addr+size is within the same page (only one page) */
-            if (addr_end <= (k+1)*blob_size-1) {
-                memcpy(buf, file->page_buf+offset, size);
-                transfer_size += size;
+                memcpy(buf, file->page_buf+offset, bytes_in);
             }
-            /* More than one page */
-            else {
-                /* Copy data from addr to the end of the address in page k */
-                memcpy(buf, file->page_buf+offset, (k+1)*blob_size-addr);
-                transfer_size += (k+1)*blob_size-addr;
-            }
+            transfer_size += bytes_in;
         }
         /* Check if addr_end is in the range of [k*blob_size, (k+1)*blob_size-1) */
         /* NOTE: The range includes the start address of page k,
            but does NOT include the end address of page k */
         else if (addr_end >= k*blob_size && addr_end < (k+1)*blob_size-1) {
+            bytes_in = addr_end-k*blob_size+1;
             if (!blob_exists) {
                 /* Seek to the correct file position. */
-                if (fseek(file->fp, addr, SEEK_SET) != 0)
+                if (fseek(file->fp, addr+transfer_size, SEEK_SET) != 0)
                     HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-                size_t bytes_read = fread(file->page_buf, sizeof(unsigned char),
-                                          blob_size, file->fp);
-                if (bytes_read != blob_size)
+                size_t bytes_read = fread(buf+transfer_size, sizeof(unsigned char),
+                                          bytes_in, file->fp);
+                if (bytes_read != bytes_in)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
             }
             else {
                 /* Read blob back to transfer buffer */
                 HermesBucketGet(file->bkt_handle, k_blob, blob_size, file->page_buf);
+
+                /* Update transfer buffer */
+                memcpy(buf+transfer_size, file->page_buf, bytes_in);
             }
-            /* Update transfer buffer */
-            memcpy(buf+transfer_size, file->page_buf, addr_end-k*blob_size+1);
-            transfer_size += addr_end-k*blob_size+1;
+            transfer_size += bytes_in;
         }
         /* Page/Blob k is within the range of (addr, addr+size) */
         else if (addr <= k*blob_size && addr_end >= (k+1)*blob_size-1) {
             if (!blob_exists) {
                 /* Seek to the correct file position. */
-                if (fseek(file->fp, addr, SEEK_SET) != 0)
+                if (fseek(file->fp, addr+transfer_size, SEEK_SET) != 0)
                     HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
                 size_t bytes_read = fread(buf+transfer_size, sizeof(unsigned char),
                                           blob_size, file->fp);
