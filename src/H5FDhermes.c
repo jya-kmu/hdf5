@@ -469,11 +469,11 @@ H5FD__hermes_close(H5FD_t *_file)
             if (fclose(file->fp) < 0)
                 HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
         }
-        if (file->ref_count == 1)
-            HermesBucketDestroy(file->bkt_handle);
-        else
-            HermesBucketClose(file->bkt_handle);
     }
+    if (file->ref_count == 1)
+        HermesBucketDestroy(file->bkt_handle);
+    else
+        HermesBucketClose(file->bkt_handle);
 
     /* Release the file info */
     file = H5FL_FREE(H5FD_hermes_t, file);
