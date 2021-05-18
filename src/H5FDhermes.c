@@ -75,13 +75,10 @@ typedef struct H5FD_hermes_t {
     hbool_t        persistence;    /* write to file name on close */
     FILE          *fp;  /* file descriptor        */
     size_t         buf_size;
-    struct blob_file_mapping *hermes_file_mapping;
-    size_t         num_writes;
     char          *bktname; /* Copy of file name from open operation */
     BucketClass   *bkt_handle;
     int            ref_count;
     unsigned char *page_buf;
-    size_t         curr_blob_in_buf;
 } H5FD_hermes_t;
 
 /* Driver-specific file access properties */
@@ -349,6 +346,16 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     if (NULL == (file = H5FL_CALLOC(H5FD_hermes_t)))
         HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, NULL, "unable to allocate file struct")
 
+    if (name && *name)
+        file->bktname = H5MM_xstrdup(name);
+    file->persistence = fa->persistence;
+    file->fp = NULL;
+    file->bkt_handle = HermesBucketCreate(name);
+    file->page_buf = HDmalloc(fa->page_size);
+    file->buf_size = fa->page_size;
+    file->ref_count = 1;
+    file->op = OP_UNKNOWN;
+
     if (fa->persistence) {
         /* Tentatively open file in read-only mode, to check for existence */
         if (flags & H5F_ACC_RDWR)
@@ -392,22 +399,6 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
         file->eof = (haddr_t)x;
     }
 
-    if (name && *name)
-        file->bktname = H5MM_xstrdup(name);
-
-    /* If save data in backing store. */
-    file->persistence = fa->persistence;
-
-    file->bkt_handle = HermesBucketCreate(name);
-
-    file->page_buf = HDmalloc(fa->page_size);
-
-    file->buf_size = fa->page_size;
-
-    file->hermes_file_mapping = NULL;
-
-    file->ref_count = 1;
-
     /* Set return value */
     ret_value = (H5FD_t *)file;
 
@@ -435,7 +426,7 @@ H5FD__hermes_close(H5FD_t *_file)
 {
     H5FD_hermes_t *file = (H5FD_hermes_t *)_file;
     size_t blob_size = file->buf_size;
-    size_t i, j;
+    size_t i;
     herr_t ret_value = SUCCEED; /* Return value */
 
     FUNC_ENTER_STATIC
@@ -443,63 +434,45 @@ H5FD__hermes_close(H5FD_t *_file)
     /* Sanity check */
     HDassert(file);
 
+    size_t num_pages = file->eof/blob_size+1;
+
     if (file->persistence) {
-        for (i = 0; i < file->num_writes; i++) {
-            size_t start_page_index = file->hermes_file_mapping[i].start_page_index;
-            haddr_t addr = file->hermes_file_mapping[i].addr;
-            size_t size = file->hermes_file_mapping[i].size;
-            haddr_t addr_end = addr+size-1;
-            size_t num_pages = file->hermes_file_mapping[i].num_pages;
-            /* write operation */
-            for (j = start_page_index; j < start_page_index+num_pages; j++) {
-                char j_blob[LEN_BLOB_NAME];
-                snprintf(j_blob, sizeof(j_blob), "%zu\n", j);
+        if (file->op == OP_WRITE) {
+            /* TODO: if there is user blobk, the logic is not working,
+               including offset, but not 0 */
+            if (fseek(file->fp, 0, SEEK_SET) != 0)
+                HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking in persistence")
+            for (i = 0; i < num_pages; i++) {
+                char i_blob[LEN_BLOB_NAME];
+                snprintf(i_blob, sizeof(i_blob), "%zu\n", i);
+
                 /* Check if this blob exists */
-                bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, j_blob);
-                /* Read blob back to transfer buffer */
+                bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, i_blob);
                 if (!blob_exists)
-                    HGOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "not able to retrieve Blob %zu", j)
+                    HGOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "not able to retrieve Blob %zu", i)
                 /* Read blob back */
-                HermesBucketGet(file->bkt_handle, j_blob, blob_size, file->page_buf);
+                HermesBucketGet(file->bkt_handle, i_blob, blob_size, file->page_buf);
 
-                if (j == start_page_index) {
-                    /* Seek to the correct file position. */
-                    if (fseek(file->fp, addr, SEEK_SET) != 0)
-                        HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking in persistence")
-
-                    size_t bytes_in;
-                    if (addr_end <= (j+1)*blob_size-1)
-                        bytes_in = size;
-                    else
-                        bytes_in = (j+1)*blob_size-addr;
-
-                    size_t bytes_wrote = fwrite(file->page_buf+addr-blob_size*j, sizeof(unsigned char), bytes_in, file->fp);
-                    assert(bytes_wrote == bytes_in);
-                }
-                else if (j == start_page_index+num_pages-1) {
-                    size_t bytes_in = (addr + size - 1) % blob_size + 1;
-                    size_t bytes_wrote = fwrite(file->page_buf, sizeof(unsigned char), bytes_in, file->fp);
+                size_t bytes_wrote;
+                if (i == num_pages-1) {
+                    size_t bytes_in = file->eof%blob_size;
+                    bytes_wrote = fwrite(file->page_buf, sizeof(unsigned char),
+                                         bytes_in, file->fp);
                     assert(bytes_wrote == bytes_in);
                 }
                 else {
-                    size_t bytes_wrote = fwrite(file->page_buf, sizeof(unsigned char), blob_size, file->fp);
+                    bytes_wrote = fwrite(file->page_buf, sizeof(unsigned char),
+                                         blob_size, file->fp);
                     assert(bytes_wrote == blob_size);
                 }
-             }
-             /* Update current position and eof */
-             file->pos = addr+size;
-             file->op  = OP_WRITE;
-             if (file->pos > file->eof) {
-                 file->eof = file->pos;
-             }
-         }
-         if (fclose(file->fp) < 0)
-             HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
-
-         if (file->ref_count == 1)
-             HermesBucketDestroy(file->bkt_handle);
-         else
-             HermesBucketClose(file->bkt_handle);
+            }
+            if (fclose(file->fp) < 0)
+                HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
+        }
+        if (file->ref_count == 1)
+            HermesBucketDestroy(file->bkt_handle);
+        else
+            HermesBucketClose(file->bkt_handle);
     }
 
     /* Release the file info */
@@ -824,18 +797,6 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
     start_page_index = addr/blob_size;
     end_page_index = (addr+size)/blob_size;
     num_pages = end_page_index - start_page_index + 1;
-
-    file->hermes_file_mapping = realloc(file->hermes_file_mapping, (file->num_writes+1)*sizeof(struct blob_file_mapping));
-
-    file->hermes_file_mapping[file->num_writes].num_pages = num_pages;
-
-    file->hermes_file_mapping[file->num_writes].start_page_index = start_page_index;
-
-    file->hermes_file_mapping[file->num_writes].addr = addr;
-
-    file->hermes_file_mapping[file->num_writes].size = size;
-
-    file->num_writes++;
 
     /* Assume only using one page now */
     for (k=start_page_index; k<=end_page_index; ++k) {
