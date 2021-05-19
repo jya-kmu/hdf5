@@ -404,8 +404,10 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
 
 done:
     if (NULL == ret_value) {
-        if (file)
+        if (file) {
+            HermesBucketDestroy(file->bkt_handle);
             file = H5FL_FREE(H5FD_hermes_t, file);
+        }
     } /* end if */
 
     FUNC_LEAVE_NOAPI(ret_value)
@@ -680,13 +682,23 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
 
             if (!blob_exists) {
                 /* Seek to the correct file position. */
-                if (fseek(file->fp, addr, SEEK_SET) != 0)
+                if (fseek(file->fp, k*blob_size, SEEK_SET) != 0)
                     HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
 
-                size_t bytes_read = fread(buf, sizeof(unsigned char),
-                                          bytes_in, file->fp);
-                if (bytes_read != bytes_in)
+                size_t bytes_copy;
+                if (file->eof < (k+1)*blob_size-1)
+                    bytes_copy = file->eof-k*blob_size;
+                else
+                    bytes_copy = blob_size;
+
+                size_t bytes_read = fread(file->page_buf, sizeof(unsigned char),
+                                          bytes_copy, file->fp);
+                if (bytes_read != bytes_copy)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
+                memcpy(buf, file->page_buf+offset, bytes_in);
+
+                /* Write Blob k to Hermes buffering system */
+                HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, blob_size);
             }
             else {
                 /* Read blob back to transfer buffer */
@@ -703,12 +715,24 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
             bytes_in = addr_end-k*blob_size+1;
             if (!blob_exists) {
                 /* Seek to the correct file position. */
-                if (fseek(file->fp, addr+transfer_size, SEEK_SET) != 0)
+                if (fseek(file->fp, k*blob_size, SEEK_SET) != 0)
                     HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-                size_t bytes_read = fread(buf+transfer_size, sizeof(unsigned char),
-                                          bytes_in, file->fp);
-                if (bytes_read != bytes_in)
+                    
+                size_t bytes_copy;
+                if (file->eof < (k+1)*blob_size-1)
+                    bytes_copy = file->eof-k*blob_size;
+                else
+                    bytes_copy = blob_size;
+
+                size_t bytes_read = fread(file->page_buf, sizeof(unsigned char),
+                                          bytes_copy, file->fp);
+                if (bytes_read != bytes_copy)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
+                    
+                memcpy(buf+transfer_size, file->page_buf, bytes_in);
+
+                /* Write Blob k to Hermes buffering system */
+                HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, blob_size);
             }
             else {
                 /* Read blob back to transfer buffer */
@@ -729,6 +753,9 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
                                           blob_size, file->fp);
                 if (bytes_read != blob_size)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
+                    
+                /* Write Blob k to Hermes buffering system */
+                HermesBucketPut(file->bkt_handle, k_blob, buf+transfer_size, blob_size);
             }
             else {
                 /* Read blob back directly */
