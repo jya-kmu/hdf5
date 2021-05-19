@@ -73,7 +73,7 @@ typedef struct H5FD_hermes_t {
     haddr_t        pos; /* current file I/O position        */
     H5FD_file_op_t op;  /* last operation                   */
     hbool_t        persistence;    /* write to file name on close */
-    FILE          *fp;  /* file descriptor        */
+    int            fd;  /* the filesystem file descriptor   */
     size_t         buf_size;
     char          *bktname; /* Copy of file name from open operation */
     BucketClass   *bkt_handle;
@@ -307,7 +307,9 @@ static H5FD_t *
 H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
 {
     H5FD_hermes_t  *file = NULL; /* hermes VFD info            */
-    FILE *          f    = NULL;
+    int             fd   = -1;   /* File descriptor          */
+    int             o_flags;     /* Flags for open() call    */
+    h5_stat_t       sb;
     const H5FD_hermes_fapl_t *fa   = NULL;
     H5P_genplist_t *plist;            /* Property list pointer */
     char           *hermes_config = NULL;
@@ -349,7 +351,7 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     if (name && *name)
         file->bktname = H5MM_xstrdup(name);
     file->persistence = fa->persistence;
-    file->fp = NULL;
+    file->fd = -1;
     file->bkt_handle = HermesBucketCreate(name);
     file->page_buf = HDmalloc(fa->page_size);
     file->buf_size = fa->page_size;
@@ -357,46 +359,29 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->op = OP_UNKNOWN;
 
     if (fa->persistence) {
-        /* Tentatively open file in read-only mode, to check for existence */
-        if (flags & H5F_ACC_RDWR)
-            f = fopen(name, "rb+");
-        else
-            f = fopen(name, "rb");
+        /* Build the open flags */
+        o_flags = (H5F_ACC_RDWR & flags) ? O_RDWR : O_RDONLY;
+        if (H5F_ACC_TRUNC & flags)
+            o_flags |= O_TRUNC;
+        if (H5F_ACC_CREAT & flags)
+            o_flags |= O_CREAT;
+        if (H5F_ACC_EXCL & flags)
+            o_flags |= O_EXCL;
 
-        if (!f) {
-            /* File doesn't exist */
-            if (flags & H5F_ACC_CREAT) {
-                assert(flags & H5F_ACC_RDWR);
-                f = fopen(name, "wb+");
-            }
-            else
-                HGOTO_ERROR(H5E_IO, H5E_CANTOPENFILE, NULL,
-                            "file doesn't exist and CREAT wasn't specified")
-        }
-        else if (flags & H5F_ACC_EXCL) {
-            /* File exists, but EXCL is passed.  Fail. */
-            assert(flags & H5F_ACC_CREAT);
-            fclose(f);
-            HGOTO_ERROR(H5E_IO, H5E_FILEEXISTS, NULL,
-                        "file exists but CREAT and EXCL were specified");
-        }
-        else if (flags & H5F_ACC_RDWR) {
-            if (flags & H5F_ACC_TRUNC)
-                f = freopen(name, "wb+", f);
-        }                     /* end if */
-        /* Note there is no need to reopen if neither TRUNC nor EXCL are specified,
-         * as the tentative open will work */
+        /* Open the file */
+        if ((fd = HDopen(name, o_flags, H5_POSIX_CREATE_MODE_RW)) < 0) {
+            int myerrno = errno;
+            HGOTO_ERROR(
+                H5E_FILE, H5E_CANTOPENFILE, NULL,
+                "unable to open file: name = '%s', errno = %d, error message = '%s', flags = %x, o_flags = %x",
+                name, myerrno, HDstrerror(myerrno), flags, (unsigned)o_flags);
+        } /* end if */
 
-        if (!f)
-            HGOTO_ERROR(H5E_IO, H5E_CANTOPENFILE, NULL, "fopen failed");
+        if (HDfstat(fd, &sb) < 0)
+            HSYS_GOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "unable to fstat file")
 
-        file->fp = f;
-
-        if (fseek(file->fp, 0, SEEK_END) != 0)
-            HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, NULL, "fseek error")
-        long x = ftell(file->fp);
-        assert(x >= 0);
-        file->eof = (haddr_t)x;
+        H5_CHECKED_ASSIGN(file->eof, haddr_t, sb.st_size, h5_stat_size_t);
+        file->fd = fd;
     }
 
     /* Set return value */
@@ -404,6 +389,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
 
 done:
     if (NULL == ret_value) {
+        if (fd >= 0)
+            HDclose(fd);
         if (file) {
             HermesBucketDestroy(file->bkt_handle);
             file = H5FL_FREE(H5FD_hermes_t, file);
@@ -442,8 +429,6 @@ H5FD__hermes_close(H5FD_t *_file)
         if (file->op == OP_WRITE) {
             /* TODO: if there is user blobk, the logic is not working,
                including offset, but not 0 */
-            if (fseek(file->fp, 0, SEEK_SET) != 0)
-                HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking in persistence")
             for (i = 0; i < num_pages; i++) {
                 char i_blob[LEN_BLOB_NAME];
                 snprintf(i_blob, sizeof(i_blob), "%zu\n", i);
@@ -455,20 +440,20 @@ H5FD__hermes_close(H5FD_t *_file)
                 /* Read blob back */
                 HermesBucketGet(file->bkt_handle, i_blob, blob_size, file->page_buf);
 
-                size_t bytes_wrote;
+                ssize_t bytes_wrote;
                 if (i == num_pages-1) {
                     size_t bytes_in = file->eof%blob_size;
-                    bytes_wrote = fwrite(file->page_buf, sizeof(unsigned char),
-                                         bytes_in, file->fp);
+                    bytes_wrote = pwrite(file->fd, file->page_buf,
+                                         bytes_in, i*blob_size);
                     assert(bytes_wrote == bytes_in);
                 }
                 else {
-                    bytes_wrote = fwrite(file->page_buf, sizeof(unsigned char),
-                                         blob_size, file->fp);
+                    bytes_wrote = pwrite(file->fd, file->page_buf,
+                                         blob_size, i*blob_size);
                     assert(bytes_wrote == blob_size);
                 }
             }
-            if (fclose(file->fp) < 0)
+            if (HDclose(file->fd) < 0)
                 HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
         }
     }
@@ -681,20 +666,16 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
                 bytes_in = (k+1)*blob_size-addr;
 
             if (!blob_exists) {
-                /* Seek to the correct file position. */
-                if (fseek(file->fp, k*blob_size, SEEK_SET) != 0)
-                    HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-
                 size_t bytes_copy;
                 if (file->eof < (k+1)*blob_size-1)
                     bytes_copy = file->eof-k*blob_size;
                 else
                     bytes_copy = blob_size;
 
-                size_t bytes_read = fread(file->page_buf, sizeof(unsigned char),
-                                          bytes_copy, file->fp);
+                size_t bytes_read = pread(file->fd, file->page_buf, bytes_copy,
+                                          k*blob_size);
                 if (bytes_read != bytes_copy)
-                    HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
+                    HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "pread failed")
                 memcpy(buf, file->page_buf+offset, bytes_in);
 
                 /* Write Blob k to Hermes buffering system */
@@ -714,20 +695,16 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
         else if (addr_end >= k*blob_size && addr_end < (k+1)*blob_size-1) {
             bytes_in = addr_end-k*blob_size+1;
             if (!blob_exists) {
-                /* Seek to the correct file position. */
-                if (fseek(file->fp, k*blob_size, SEEK_SET) != 0)
-                    HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-
                 size_t bytes_copy;
                 if (file->eof < (k+1)*blob_size-1)
                     bytes_copy = file->eof-k*blob_size;
                 else
                     bytes_copy = blob_size;
 
-                size_t bytes_read = fread(file->page_buf, sizeof(unsigned char),
-                                          bytes_copy, file->fp);
+                ssize_t bytes_read = pread(file->fd, file->page_buf, bytes_copy,
+                                           k*blob_size);
                 if (bytes_read != bytes_copy)
-                    HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
+                    HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "pread failed")
 
                 memcpy(buf+transfer_size, file->page_buf, bytes_in);
 
@@ -747,13 +724,10 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
         /* addr <= k*blob_size && addr_end >= (k+1)*blob_size-1 */
         else {
             if (!blob_exists) {
-                /* Seek to the correct file position. */
-                if (fseek(file->fp, addr+transfer_size, SEEK_SET) != 0)
-                    HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-                size_t bytes_read = fread(buf+transfer_size, sizeof(unsigned char),
-                                          blob_size, file->fp);
+                ssize_t bytes_read = pread(file->fd, buf+transfer_size, blob_size,
+                                           addr+transfer_size);
                 if (bytes_read != blob_size)
-                    HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
+                    HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "pread failed")
 
                 /* Write Blob k to Hermes buffering system */
                 HermesBucketPut(file->bkt_handle, k_blob, buf+transfer_size, blob_size);
