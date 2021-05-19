@@ -717,7 +717,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
                 /* Seek to the correct file position. */
                 if (fseek(file->fp, k*blob_size, SEEK_SET) != 0)
                     HGOTO_ERROR(H5E_IO, H5E_SEEKERROR, FAIL, "error seeking failed")
-                    
+
                 size_t bytes_copy;
                 if (file->eof < (k+1)*blob_size-1)
                     bytes_copy = file->eof-k*blob_size;
@@ -728,7 +728,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
                                           bytes_copy, file->fp);
                 if (bytes_read != bytes_copy)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
-                    
+
                 memcpy(buf+transfer_size, file->page_buf, bytes_in);
 
                 /* Write Blob k to Hermes buffering system */
@@ -744,7 +744,8 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
             transfer_size += bytes_in;
         }
         /* Page/Blob k is within the range of (addr, addr+size) */
-        else if (addr <= k*blob_size && addr_end >= (k+1)*blob_size-1) {
+        /* addr <= k*blob_size && addr_end >= (k+1)*blob_size-1 */
+        else {
             if (!blob_exists) {
                 /* Seek to the correct file position. */
                 if (fseek(file->fp, addr+transfer_size, SEEK_SET) != 0)
@@ -753,7 +754,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
                                           blob_size, file->fp);
                 if (bytes_read != blob_size)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "fread failed")
-                    
+
                 /* Write Blob k to Hermes buffering system */
                 HermesBucketPut(file->bkt_handle, k_blob, buf+transfer_size, blob_size);
             }
