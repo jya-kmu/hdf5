@@ -38,10 +38,14 @@
 
 #ifdef H5_HAVE_HERMES_VFD
 
-/* Necessary hermes headers */
+/**
+ * Necessary hermes headers
+ */
 #include "hermes_wrapper.h"
 
-/* The driver identification number, initialized at runtime */
+/**
+ * The driver identification number, initialized at runtime
+ */
 static hid_t H5FD_HERMES_g = 0;
 
 /* Whether Hermes is initialized */
@@ -52,20 +56,25 @@ static htri_t hermes_initialized = FAIL;
  */
 #define LEN_BLOB_NAME 10
 
+#define BIT_SIZE_OF_SIZE_UINT (sizeof(uint)*8)
+
 /**
  * kHermesConf env variable is used to define path to kHermesConf in adapters.
  * This is used for initialization of Hermes.
  */
 const char *kHermesConf = "HERMES_CONF";
 
-struct blob_file_mapping {
-    size_t         start_page_index;
-    size_t         num_pages;
-    size_t         size;
-    haddr_t        addr;
-};
+/**
+ * The description of bit representation of blobs in Hermes buffering system.
+ */
+typedef struct bitv_t {
+    uint  *blobs;
+    size_t capacity;
+} bitv_t;
 
-/* The description of a file/bucket belonging to this driver. */
+/**
+ * The description of a file/bucket belonging to this driver.
+ */
 typedef struct H5FD_hermes_t {
     H5FD_t         pub; /* public stuff, must be first      */
     haddr_t        eoa; /* end of allocated region          */
@@ -79,15 +88,18 @@ typedef struct H5FD_hermes_t {
     BucketClass   *bkt_handle;
     int            ref_count;
     unsigned char *page_buf;
+    bitv_t         blob_in_bucket;
 } H5FD_hermes_t;
 
-/* Driver-specific file access properties */
+/**
+ * Driver-specific file access properties
+ */
 typedef struct H5FD_hermes_fapl_t {
     hbool_t persistence;  /* write to file name on flush */
     size_t  page_size; /* page size */
 } H5FD_hermes_fapl_t;
 
-/*
+/**
  * These macros check for overflow of various quantities.  These macros
  * assume that HDoff_t is signed and haddr_t and size_t are unsigned.
  *
@@ -108,7 +120,9 @@ typedef struct H5FD_hermes_fapl_t {
 #define REGION_OVERFLOW(A, Z)                                                                                \
     (ADDR_OVERFLOW(A) || SIZE_OVERFLOW(Z) || HADDR_UNDEF == (A) + (Z) || (HDoff_t)((A) + (Z)) < (HDoff_t)(A))
 
-/* Prototypes */
+/**
+ * Prototypes
+ */
 static herr_t  H5FD__hermes_term(void);
 static herr_t  H5FD__hermes_fapl_free(void *_fa);
 static H5FD_t *H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr);
@@ -158,8 +172,48 @@ static const H5FD_class_t H5FD_hermes_g = {
     H5FD_FLMAP_DICHOTOMY       /* fl_map               */
 };
 
-/* Declare a free list to manage the H5FD_hermes_t struct */
+/**
+ * Declare a free list to manage the H5FD_hermes_t struct
+ */
 H5FL_DEFINE_STATIC(H5FD_hermes_t);
+
+/**
+ * Check if the blob at POS is set
+ */
+bool check_blob(bitv_t *bits, size_t pos)
+{
+    bool result = false;
+
+    if (pos >= bits->capacity)
+        return false;
+
+    size_t unit_pos = pos/BIT_SIZE_OF_SIZE_UINT;
+    size_t blob_pos_in_unit = pos%BIT_SIZE_OF_SIZE_UINT;
+    result = bits->blobs[unit_pos] & (1<<blob_pos_in_unit);
+
+    return result;
+}
+
+/**
+ * Set the bit at POS and reallocate 2*capacity for blobs as needed
+ */
+void set_blob(bitv_t *bits, size_t pos)
+{
+    uint i = 0;
+
+    if (pos >= bits->capacity) {
+        size_t current_units = bits->capacity/BIT_SIZE_OF_SIZE_UINT;
+        size_t need_units = pos/BIT_SIZE_OF_SIZE_UINT + 1;
+        bits->capacity = need_units * BIT_SIZE_OF_SIZE_UINT * 2;
+        bits->blobs = HDrealloc(bits->blobs, bits->capacity);
+        memset(&bits->blobs[current_units], 0, sizeof(uint)*(need_units*2-current_units+1));
+    }
+
+    size_t unit_pos = pos/BIT_SIZE_OF_SIZE_UINT;
+    size_t blob_pos_in_unit = pos%BIT_SIZE_OF_SIZE_UINT;
+    bits->blobs[unit_pos] |= 1<<blob_pos_in_unit;
+
+}
 
 /*-------------------------------------------------------------------------
  * Function:    H5FD__init_package
@@ -306,7 +360,7 @@ H5FD__hermes_fapl_free(void *_fa)
 static H5FD_t *
 H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
 {
-    H5FD_hermes_t  *file = NULL; /* hermes VFD info            */
+    H5FD_hermes_t  *file = NULL; /* hermes VFD info          */
     int             fd   = -1;   /* File descriptor          */
     int             o_flags;     /* Flags for open() call    */
     h5_stat_t       sb;
@@ -357,6 +411,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->buf_size = fa->page_size;
     file->ref_count = 1;
     file->op = OP_UNKNOWN;
+    file->blob_in_bucket.capacity = BIT_SIZE_OF_SIZE_UINT;
+    file->blob_in_bucket.blobs = (uint *)HDcalloc(1, sizeof(uint));
 
     if (fa->persistence) {
         /* Build the open flags */
@@ -393,6 +449,7 @@ done:
             HDclose(fd);
         if (file) {
             HermesBucketDestroy(file->bkt_handle);
+            free(file->blob_in_bucket.blobs);
             file = H5FL_FREE(H5FD_hermes_t, file);
         }
     } /* end if */
@@ -434,7 +491,7 @@ H5FD__hermes_close(H5FD_t *_file)
                 snprintf(i_blob, sizeof(i_blob), "%zu\n", i);
 
                 /* Check if this blob exists */
-                bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, i_blob);
+                bool blob_exists = check_blob(&file->blob_in_bucket, i);
                 if (!blob_exists)
                     HGOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "not able to retrieve Blob %zu", i)
                 /* Read blob back */
@@ -463,6 +520,7 @@ H5FD__hermes_close(H5FD_t *_file)
         HermesBucketClose(file->bkt_handle);
 
     /* Release the file info */
+    free(file->blob_in_bucket.blobs);
     file = H5FL_FREE(H5FD_hermes_t, file);
 
 done:
@@ -650,7 +708,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
         char k_blob[LEN_BLOB_NAME];
         snprintf(k_blob, sizeof(k_blob), "%zu\n", k);
         /* Check if this blob exists */
-        bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, k_blob);
+        bool blob_exists = check_blob(&file->blob_in_bucket, k);
 
         /* Check if addr is in the range of (k*blob_size, (k+1)*blob_size) */
         /* NOTE: The range does NOT include the start address of page k,
@@ -680,6 +738,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
 
                 /* Write Blob k to Hermes buffering system */
                 HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, blob_size);
+                set_blob(&file->blob_in_bucket, k);
             }
             else {
                 /* Read blob back to transfer buffer */
@@ -710,6 +769,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
 
                 /* Write Blob k to Hermes buffering system */
                 HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, blob_size);
+                set_blob(&file->blob_in_bucket, k);
             }
             else {
                 /* Read blob back to transfer buffer */
@@ -731,6 +791,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
 
                 /* Write Blob k to Hermes buffering system */
                 HermesBucketPut(file->bkt_handle, k_blob, buf+transfer_size, blob_size);
+                set_blob(&file->blob_in_bucket, k);
             }
             else {
                 /* Read blob back directly */
@@ -809,7 +870,7 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
            but includes the end address of page k */
         if (addr > k*blob_size && addr < (k+1)*blob_size) {
             /* Check if this blob exists */
-            bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, k_blob);
+            bool blob_exists = check_blob(&file->blob_in_bucket, k);
             /* Read blob back to transfer buffer */
             if (blob_exists) {
                 HermesBucketGet(file->bkt_handle, k_blob, blob_size, file->page_buf);
@@ -832,13 +893,14 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
             }
             /* Write Blob k to Hermes buffering system */
             HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, blob_size);
+            set_blob(&file->blob_in_bucket, k);
         }
         /* Check if addr_end is in the range of [k*blob_size, (k+1)*blob_size-1) */
         /* NOTE: The range includes the start address of page k,
            but does NOT include the end address of page k */
         else if (addr_end >= k*blob_size && addr_end < (k+1)*blob_size-1) {
             /* Check if this blob exists */
-            bool blob_exists = HermesBucketContainsBlob(file->bkt_handle, k_blob);
+            bool blob_exists = check_blob(&file->blob_in_bucket, k);
             /* Read blob back */
             if (blob_exists) {
                 unsigned char *put_data_ptr = (unsigned char *)file->page_buf;
@@ -849,12 +911,14 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
             transfer_size += addr_end-k*blob_size+1;
             /* Write Blob k to Hermes buffering system */
             HermesBucketPut(file->bkt_handle, k_blob, file->page_buf, blob_size);
+            set_blob(&file->blob_in_bucket, k);
         }
         /* Page/Blob k is within the range of (addr, addr+size) */
         else if (addr <= k*blob_size && addr_end >= (k+1)*blob_size-1) {
             /* Update transfer buffer */
             /* Write Blob k to Hermes buffering system */
             HermesBucketPut(file->bkt_handle, k_blob, buf+transfer_size, blob_size);
+            set_blob(&(file->blob_in_bucket), k);
             transfer_size += blob_size;
         }
     }
