@@ -56,7 +56,7 @@ static htri_t hermes_initialized = FAIL;
  */
 #define LEN_BLOB_NAME 10
 
-#define BIT_SIZE_OF_SIZE_UINT (sizeof(uint)*8)
+#define BIT_SIZE_OF_SIZE_T (sizeof(size_t)*8)
 
 /**
  * kHermesConf env variable is used to define path to kHermesConf in adapters.
@@ -68,8 +68,8 @@ const char *kHermesConf = "HERMES_CONF";
  * The description of bit representation of blobs in Hermes buffering system.
  */
 typedef struct bitv_t {
-    uint  *blobs;
-    size_t capacity;
+    size_t *blobs;
+    size_t  capacity;
 } bitv_t;
 
 /**
@@ -180,15 +180,15 @@ H5FL_DEFINE_STATIC(H5FD_hermes_t);
 /**
  * Check if the blob at POS is set
  */
-bool check_blob(bitv_t *bits, size_t pos)
+static bool check_blob(bitv_t *bits, size_t bit_pos)
 {
     bool result = false;
 
-    if (pos >= bits->capacity)
+    if (bit_pos >= bits->capacity)
         return false;
 
-    size_t unit_pos = pos/BIT_SIZE_OF_SIZE_UINT;
-    size_t blob_pos_in_unit = pos%BIT_SIZE_OF_SIZE_UINT;
+    size_t unit_pos = bit_pos/BIT_SIZE_OF_SIZE_T;
+    size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_SIZE_T;
     result = bits->blobs[unit_pos] & (1<<blob_pos_in_unit);
 
     return result;
@@ -197,20 +197,18 @@ bool check_blob(bitv_t *bits, size_t pos)
 /**
  * Set the bit at POS and reallocate 2*capacity for blobs as needed
  */
-void set_blob(bitv_t *bits, size_t pos)
+static void set_blob(bitv_t *bits, size_t bit_pos)
 {
-    uint i = 0;
-
-    if (pos >= bits->capacity) {
-        size_t current_units = bits->capacity/BIT_SIZE_OF_SIZE_UINT;
-        size_t need_units = pos/BIT_SIZE_OF_SIZE_UINT + 1;
-        bits->capacity = need_units * BIT_SIZE_OF_SIZE_UINT * 2;
+    if (bit_pos >= bits->capacity) {
+        size_t current_units = bits->capacity/BIT_SIZE_OF_SIZE_T;
+        size_t need_units = bit_pos/BIT_SIZE_OF_SIZE_T + 1;
+        bits->capacity = need_units * BIT_SIZE_OF_SIZE_T * 2;
         bits->blobs = HDrealloc(bits->blobs, bits->capacity);
         memset(&bits->blobs[current_units], 0, sizeof(uint)*(need_units*2-current_units+1));
     }
 
-    size_t unit_pos = pos/BIT_SIZE_OF_SIZE_UINT;
-    size_t blob_pos_in_unit = pos%BIT_SIZE_OF_SIZE_UINT;
+    size_t unit_pos = bit_pos/BIT_SIZE_OF_SIZE_T;
+    size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_SIZE_T;
     bits->blobs[unit_pos] |= 1<<blob_pos_in_unit;
 
 }
@@ -411,8 +409,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->buf_size = fa->page_size;
     file->ref_count = 1;
     file->op = OP_UNKNOWN;
-    file->blob_in_bucket.capacity = BIT_SIZE_OF_SIZE_UINT;
-    file->blob_in_bucket.blobs = (uint *)HDcalloc(1, sizeof(uint));
+    file->blob_in_bucket.capacity = BIT_SIZE_OF_SIZE_T;
+    file->blob_in_bucket.blobs = (size_t *)HDcalloc(1, sizeof(size_t));
 
     if (fa->persistence) {
         /* Build the open flags */
@@ -903,7 +901,6 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
             bool blob_exists = check_blob(&file->blob_in_bucket, k);
             /* Read blob back */
             if (blob_exists) {
-                unsigned char *put_data_ptr = (unsigned char *)file->page_buf;
                 HermesBucketGet(file->bkt_handle, k_blob, blob_size, file->page_buf);
             }
             /* Update transfer buffer */
