@@ -56,7 +56,7 @@ static htri_t hermes_initialized = FAIL;
  */
 #define LEN_BLOB_NAME 10
 
-#define BIT_SIZE_OF_SIZE_T (sizeof(size_t)*8)
+#define BIT_SIZE_OF_UNSIGNED (sizeof(uint)*8)
 
 /**
  * kHermesConf env variable is used to define path to kHermesConf in adapters.
@@ -68,8 +68,8 @@ const char *kHermesConf = "HERMES_CONF";
  * The description of bit representation of blobs in Hermes buffering system.
  */
 typedef struct bitv_t {
-    size_t *blobs;
-    size_t  capacity;
+    uint  *blobs;
+    size_t capacity;
 } bitv_t;
 
 /**
@@ -187,8 +187,8 @@ static bool check_blob(bitv_t *bits, size_t bit_pos)
     if (bit_pos >= bits->capacity)
         return false;
 
-    size_t unit_pos = bit_pos/BIT_SIZE_OF_SIZE_T;
-    size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_SIZE_T;
+    size_t unit_pos = bit_pos/BIT_SIZE_OF_UNSIGNED;
+    size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_UNSIGNED;
     result = bits->blobs[unit_pos] & (1<<blob_pos_in_unit);
 
     return result;
@@ -200,15 +200,15 @@ static bool check_blob(bitv_t *bits, size_t bit_pos)
 static void set_blob(bitv_t *bits, size_t bit_pos)
 {
     if (bit_pos >= bits->capacity) {
-        size_t current_units = bits->capacity/BIT_SIZE_OF_SIZE_T;
-        size_t need_units = bit_pos/BIT_SIZE_OF_SIZE_T + 1;
-        bits->capacity = need_units * BIT_SIZE_OF_SIZE_T * 2;
+        size_t current_units = bits->capacity/BIT_SIZE_OF_UNSIGNED;
+        size_t need_units = bit_pos/BIT_SIZE_OF_UNSIGNED + 1;
+        bits->capacity = need_units * BIT_SIZE_OF_UNSIGNED * 2;
         bits->blobs = HDrealloc(bits->blobs, bits->capacity);
         memset(&bits->blobs[current_units], 0, sizeof(uint)*(need_units*2-current_units+1));
     }
 
-    size_t unit_pos = bit_pos/BIT_SIZE_OF_SIZE_T;
-    size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_SIZE_T;
+    size_t unit_pos = bit_pos/BIT_SIZE_OF_UNSIGNED;
+    size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_UNSIGNED;
     bits->blobs[unit_pos] |= 1<<blob_pos_in_unit;
 
 }
@@ -409,8 +409,8 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->buf_size = fa->page_size;
     file->ref_count = 1;
     file->op = OP_UNKNOWN;
-    file->blob_in_bucket.capacity = BIT_SIZE_OF_SIZE_T;
-    file->blob_in_bucket.blobs = (size_t *)HDcalloc(1, sizeof(size_t));
+    file->blob_in_bucket.capacity = BIT_SIZE_OF_UNSIGNED;
+    file->blob_in_bucket.blobs = (uint *)HDcalloc(1, sizeof(uint));
 
     if (fa->persistence) {
         /* Build the open flags */
