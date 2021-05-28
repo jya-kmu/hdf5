@@ -70,6 +70,7 @@ const char *kHermesConf = "HERMES_CONF";
 typedef struct bitv_t {
     uint  *blobs;
     size_t capacity;
+    size_t  end_pos;
 } bitv_t;
 
 /**
@@ -210,7 +211,8 @@ static void set_blob(bitv_t *bits, size_t bit_pos)
     size_t unit_pos = bit_pos/BIT_SIZE_OF_UNSIGNED;
     size_t blob_pos_in_unit = bit_pos%BIT_SIZE_OF_UNSIGNED;
     bits->blobs[unit_pos] |= 1<<blob_pos_in_unit;
-
+    if (bit_pos > bits->end_pos)
+        bits->end_pos = bit_pos;
 }
 
 /*-------------------------------------------------------------------------
@@ -411,6 +413,7 @@ H5FD__hermes_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxad
     file->op = OP_UNKNOWN;
     file->blob_in_bucket.capacity = BIT_SIZE_OF_UNSIGNED;
     file->blob_in_bucket.blobs = (uint *)HDcalloc(1, sizeof(uint));
+    file->blob_in_bucket.end_pos = 0;
 
     if (fa->persistence) {
         /* Build the open flags */
@@ -478,25 +481,22 @@ H5FD__hermes_close(H5FD_t *_file)
     /* Sanity check */
     HDassert(file);
 
-    size_t num_pages = file->eof/blob_size+1;
-
     if (file->persistence) {
         if (file->op == OP_WRITE) {
             /* TODO: if there is user blobk, the logic is not working,
                including offset, but not 0 */
-            for (i = 0; i < num_pages; i++) {
-                char i_blob[LEN_BLOB_NAME];
-                snprintf(i_blob, sizeof(i_blob), "%zu\n", i);
-
+            for (i = 0; i <= file->blob_in_bucket.end_pos; i++) {
                 /* Check if this blob exists */
                 bool blob_exists = check_blob(&file->blob_in_bucket, i);
                 if (!blob_exists)
-                    HGOTO_ERROR(H5E_INTERNAL, H5E_BADVALUE, FAIL, "not able to retrieve Blob %zu", i)
+                    continue;
+
+                char i_blob[LEN_BLOB_NAME];
+                snprintf(i_blob, sizeof(i_blob), "%zu\n", i);
                 /* Read blob back */
                 HermesBucketGet(file->bkt_handle, i_blob, blob_size, file->page_buf);
-
                 ssize_t bytes_wrote;
-                if (i == num_pages-1) {
+                if (i == file->blob_in_bucket.end_pos) {
                     size_t bytes_in = file->eof%blob_size;
                     bytes_wrote = pwrite(file->fd, file->page_buf,
                                          bytes_in, i*blob_size);
