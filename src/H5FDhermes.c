@@ -698,7 +698,7 @@ H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_U
     }
 
     start_page_index = addr/blob_size;
-    end_page_index = (addr+size)/blob_size;
+    end_page_index = addr_end/blob_size;
     num_pages = end_page_index - start_page_index + 1;
 
     for (k = start_page_index; k <= end_page_index; ++k) {
@@ -856,7 +856,7 @@ H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t H5_ATTR_UNUSED type, hid_t H5_ATTR_
         HGOTO_ERROR(H5E_INTERNAL, H5E_UNINITIALIZED, FAIL, "transfer buffer not initialized")
 
     start_page_index = addr/blob_size;
-    end_page_index = (addr+size)/blob_size;
+    end_page_index = addr_end/blob_size;
     num_pages = end_page_index - start_page_index + 1;
 
     /* Assume only using one page now */
