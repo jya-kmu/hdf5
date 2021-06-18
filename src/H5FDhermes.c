@@ -498,6 +498,8 @@ H5FD__hermes_close(H5FD_t *_file)
                 ssize_t bytes_wrote;
                 if (i == file->blob_in_bucket.end_pos) {
                     size_t bytes_in = file->eof%blob_size;
+                    if (bytes_in == 0)
+                        bytes_in = blob_size;
                     bytes_wrote = pwrite(file->fd, file->page_buf,
                                          bytes_in, i*blob_size);
                     assert(bytes_wrote == bytes_in);
@@ -508,9 +510,9 @@ H5FD__hermes_close(H5FD_t *_file)
                     assert(bytes_wrote == blob_size);
                 }
             }
-            if (HDclose(file->fd) < 0)
-                HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
         }
+        if (HDclose(file->fd) < 0)
+            HSYS_GOTO_ERROR(H5E_IO, H5E_CANTCLOSEFILE, FAIL, "unable to close file")
     }
     if (file->ref_count == 1)
         HermesBucketDestroy(file->bkt_handle);
